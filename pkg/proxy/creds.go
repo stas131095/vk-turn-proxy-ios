@@ -898,6 +898,17 @@ type credPool struct {
 	// See pauseAcquireAfterPathEvent comment for the full rationale.
 	pauseAcquireUntil time.Time
 
+	// pauseAcquireTimer fires broadcastSlotAvailable at pauseAcquireUntil
+	// expiry so conns parked in runConnection's dormancy select wake up
+	// the moment the pool unblocks, instead of sleeping out their full
+	// dormantDuration. Without this, vpn.wifi-lte-wifi.1.log 2026-05-15
+	// 13:03 cascade burned 4m20s waiting for the 5-min watchdog after
+	// pauseAcquireUntil expired at +30s — every conn was sleeping in
+	// dormancy with no signal that the credpool was ready.
+	// (Re)armed by armPauseAcquireBroadcastLocked whenever pauseAcquire
+	// Until is extended; idempotent (Stop+nil before re-arm).
+	pauseAcquireTimer *time.Timer
+
 	// lastPathEventAt is the timestamp of the most recent
 	// MarkInUseSlotsForPathChange invocation. Used for adaptive cascade
 	// detection: if a new path event fires within cascadeDetectionWindow
@@ -2003,8 +2014,41 @@ func (cp *credPool) MarkInUseSlotsForPathChange() {
 	deadline := now.Add(pauseDur)
 	if deadline.After(cp.pauseAcquireUntil) {
 		cp.pauseAcquireUntil = deadline
+		cp.armPauseAcquireBroadcastLocked()
 	}
 	cp.lastPathEventAt = now
+}
+
+// armPauseAcquireBroadcastLocked (re)schedules a one-shot broadcast on
+// slotAvailableCh for the current pauseAcquireUntil deadline. Caller must
+// hold cp.mu.
+//
+// This is what wakes conns parked in runConnection's dormancy select
+// (proxy.go:1606) at the moment the credpool unblocks. Without it, a conn
+// that entered dormancy during a path-change cascade waits out its full
+// random dormantDuration before retrying — even if pauseAcquireUntil
+// expired earlier. Empirically surfaced by vpn.wifi-lte-wifi.1.log
+// 2026-05-15 13:03 where 30 conns idled 4m20s after the 30s cascade pause
+// expired, recovery only happening when the 5-min watchdog kicked in.
+//
+// Stops any previously-armed timer first so re-arming on extension (next
+// path event arriving before the prior pause expired) doesn't double-fire
+// or fire at the OLD deadline. Stop+nil is safe even if the old timer
+// already fired — Stop returns false in that case, no panic.
+//
+// Spurious broadcasts are harmless by broadcastSlotAvailable's design:
+// a conn that wakes only to find no usable slot just re-parks on the
+// next channel.
+func (cp *credPool) armPauseAcquireBroadcastLocked() {
+	if cp.pauseAcquireTimer != nil {
+		cp.pauseAcquireTimer.Stop()
+		cp.pauseAcquireTimer = nil
+	}
+	delay := time.Until(cp.pauseAcquireUntil)
+	if delay <= 0 {
+		return
+	}
+	cp.pauseAcquireTimer = time.AfterFunc(delay, cp.broadcastSlotAvailable)
 }
 
 // ExtendPauseAcquireForTransition extends pauseAcquireUntil without marking
@@ -2038,6 +2082,7 @@ func (cp *credPool) ExtendPauseAcquireForTransition(d time.Duration) {
 	deadline := time.Now().Add(d)
 	if deadline.After(cp.pauseAcquireUntil) {
 		cp.pauseAcquireUntil = deadline
+		cp.armPauseAcquireBroadcastLocked()
 	}
 }
 

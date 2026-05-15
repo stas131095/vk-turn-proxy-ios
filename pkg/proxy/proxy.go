@@ -1544,9 +1544,17 @@ func (p *Proxy) StopWithTimeout(timeout time.Duration) {
 
 // runConnection runs a single connection slot with reconnection.
 // Reconnects on failure until sessCtx is cancelled (Pause/Resume) or global ctx is done (Stop).
-// After 3 consecutive short-lived failures, goes dormant for up to 3 minutes.
+// After 3 consecutive short-lived failures, goes dormant for up to 1 minute.
 // This avoids hammering the TURN server (Allocation Quota Reached) while still
 // recovering without relying on iOS sleep()/wake() which are unreliable.
+//
+// Dormancy was 30-180s pre-build-88. Shortened to 30-60s once credpool
+// gained its own VK 486 protection layers (smart-pause / cascade-pause /
+// 12m activeAllocationsWindow / compact-fill) — the conn-side long
+// dormancy was double-insurance that primarily slowed real recovery. With
+// armPauseAcquireBroadcastLocked (creds.go) firing slotAvailableCh on
+// pause-expiry, the 30-60s cap rarely runs to completion anyway: conns
+// wake within ms of pool-state change.
 func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh chan<- struct{}, connIdx int) error {
 	signaled := false
 	shortFailures := 0
@@ -1586,14 +1594,21 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 				shortFailures++
 			}
 
-			// After 3 consecutive short-lived failures, go dormant for up to 3 minutes.
-			// This prevents hammering the TURN server when Allocation Quota is reached.
-			// Previously this waited forever for Resume(), but iOS doesn't reliably
-			// call wake() — so we use a timeout and retry with staggered delay.
+			// After 3 consecutive short-lived failures, go dormant for up to 1 minute.
+			// Originally up to 3 minutes — the long ceiling protected VK from
+			// post-cascade Allocate burst before the credpool layer could.
+			// Build 87+ has its own 486 defenses (smart-pause + cascade pause +
+			// 12m activeAllocationsWindow + compact-fill); the long dormancy
+			// became double-insurance that mostly hurt recovery. Shortened to
+			// 30-60s in build 88. Critically, slotAvailableCh below short-circuits
+			// the wait the moment pool state changes — including pauseAcquireUntil
+			// expiry now that armPauseAcquireBroadcastLocked fires on it — so most
+			// dormancies wake within ms of the pool unblocking, not at the cap.
 			if shortFailures >= 3 {
-				// Stagger dormancy wake-up: random 30s-3min so all 10 connections
-				// don't try to reconnect simultaneously (which causes Quota Reached).
-				dormantDuration := time.Duration(30+mathrand.Intn(150)) * time.Second
+				// Stagger dormancy wake-up: random 30-60s so all conns
+				// don't try to reconnect simultaneously (which used to
+				// cause Quota Reached before credpool's own protection).
+				dormantDuration := time.Duration(30+mathrand.Intn(30)) * time.Second
 				log.Printf("proxy: %d consecutive short failures, sleeping %s before retry", shortFailures, dormantDuration.Round(time.Second))
 				// slotAvailableCh wakes the conn early on any pool-state
 				// change that could plausibly let it succeed: a fresh
