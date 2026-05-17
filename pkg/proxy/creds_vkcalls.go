@@ -12,16 +12,28 @@ package proxy
 //   - api ver:    v=5.276                        (not v=5.275)
 //   - call ep:    /method/messages.getAnonymCallToken  (not /method/calls.getAnonymousToken)
 //
-// VK gates anon flows per-(FQDN, API method, client_id). On 2026-05-15 VK
-// added a captcha gate to calls.getAnonymousToken across all our client_ids
-// — that's what broke our legacy flow. The messages.getAnonymCallToken path
-// with VK Connect's public client_id (8093730 — no client_secret required)
-// is captcha-free as of 2026-05-17.
+// VK gates anon flows per-(FQDN, API method, client_id). The captcha gate
+// on calls.getAnonymousToken has existed for a long time (months+); we had
+// a working PoW + WebView captcha solver (captcha_pow.go) and VK has been
+// periodically updating detection rules — each update would temporarily
+// reduce our solve rate (e.g. ~2026-05-08/09 update dropped success 88%
+// → 6%, fixed by build 85 on 2026-05-11 back to 55%). The 2026-05-15 update
+// was the first one we couldn't recover from in the HTTP layer (proven
+// empirically dead-end across 11 phases + 3-platform test: iOS extension,
+// Mac standalone, FreeBSD VPS — all return BOT 100%).
 //
-// 🚨 EXPECT VK TO ADD A CAPTCHA GATE HERE EVENTUALLY (weeks-to-months).
-// When that happens, the legacy captcha solver (captcha_pow.go) and WebView
-// fallback in creds.go still cover the case via GetVKCreds's auto-fallback
-// chain. Do NOT delete legacy code.
+// The messages.getAnonymCallToken path with VK Connect's public client_id
+// (8093730 — no client_secret required) is captcha-free entirely as of
+// 2026-05-17. Not because it's a new endpoint VK forgot to gate, but because
+// VK treats VK Connect's anonymous tokens as already-trusted identity.
+//
+// 🚨 EXPECT VK TO ADD A CAPTCHA GATE HERE EVENTUALLY (weeks-to-months) —
+// the same arms-race pattern. When that happens, the legacy captcha solver
+// (captcha_pow.go) and WebView fallback in creds.go still cover the case
+// via GetVKCreds's auto-fallback chain. Do NOT delete legacy code — and
+// when the time comes, our discovery methodology (anyipa.me + PlayCover +
+// frida trace, see memory file) is reusable to find the next captcha-free
+// path VK Calls migrates to.
 //
 // Discovery methodology: anyipa.me decrypt of VK Calls IPA + PlayCover
 // runtime + frida-trace NSURLSession hook captured one messages.getCallPreview
