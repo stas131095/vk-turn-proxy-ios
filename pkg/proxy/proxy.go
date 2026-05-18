@@ -2084,7 +2084,19 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 						// the start).
 						lastPing := p.lastPingSeq[connIdx].Load()
 						lastPongS := p.lastPongSeq[connIdx].Load()
-						sentSinceLastPong := lastPing - lastPongS
+						// Guard against uint64 underflow when lastPongS > lastPing.
+						// This is possible transiently because the two atomic Loads
+						// happen non-atomically with respect to the ping-send /
+						// pong-recv paths: a pong for ping N can be observed AFTER
+						// we Load lastPing=N-1 but BEFORE lastPongS=N is recorded
+						// is purely a function of which Load executes first. Without
+						// this clamp the log shows sentSinceLastPong=18446744073709551614
+						// (= 2^64 - 2) which is meaningless. Empirical case 2026-05-18
+						// vpn.wifi.0.log conn 18 @ 04:05:28.
+						var sentSinceLastPong uint64
+						if lastPing >= lastPongS {
+							sentSinceLastPong = lastPing - lastPongS
+						}
 						firstPong := p.firstPongAt[connIdx].Load()
 						pongHistory := "never"
 						if firstPong > 0 {
@@ -2186,8 +2198,15 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				if !echoed {
 					lastPongS := p.lastPongSeq[connIdx].Load()
 					authCount := p.credPool.authErrorCount(credSlot)
+					// Same uint64 underflow guard as the zombie-detect path above:
+					// concurrent periodic-probe goroutine can push lastPongS past
+					// this active probe's sentSeq before our deadline expires.
+					var sentSinceLastPong uint64
+					if sentSeq >= lastPongS {
+						sentSinceLastPong = sentSeq - lastPongS
+					}
 					log.Printf("proxy: [conn %d on slot %d] active probe (post-wake) no echo within 30s (sentSeq=%d lastPongSeq=%d sentSinceLastPong=%d authErrorsOnSlot=%d), killing",
-						connIdx, credSlot, sentSeq, lastPongS, sentSeq-lastPongS, authCount)
+						connIdx, credSlot, sentSeq, lastPongS, sentSinceLastPong, authCount)
 					connCancel()
 					return
 				}
