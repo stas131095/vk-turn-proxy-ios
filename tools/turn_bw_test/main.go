@@ -130,6 +130,12 @@ func main() {
 			"address on the relay. Total worker count = parallel * "+
 			"allocs-per-cred. VK's per-cred quota is 10 — values above "+
 			"that will produce 486 Allocation Quota Reached errors.")
+	relayAddr := flag.String("relay-addr", "",
+		"override TURN relay address (host:port). When set, all workers "+
+			"connect to this address instead of cred.Address — used to "+
+			"test the second URL from VK turn_server.urls without "+
+			"modifying backup. Cred username/password are unchanged; if "+
+			"VK rejects them on this relay, Allocate fails fast (401).")
 	flag.Parse()
 
 	if *credsPath == "" {
@@ -186,6 +192,18 @@ func main() {
 		creds = all[:*parallel]
 	}
 
+	// -relay-addr override: replace each cred's relay address with the
+	// user-supplied one (typically the second URL from VK turn_server.urls
+	// to test whether per-allocation blackhole rate differs across the two
+	// relays VK returns). Cred username/password stay as-is — VK creds
+	// from one vchat.joinConversationByLink are valid on any relay in
+	// the URL list.
+	if *relayAddr != "" {
+		for _, c := range creds {
+			c.Address = *relayAddr
+		}
+	}
+
 	dstAddr := &net.UDPAddr{IP: net.ParseIP(*dstIP), Port: *dstPort}
 
 	// Expand creds × allocs-per-cred into a flat list of workers. Each
@@ -211,7 +229,11 @@ func main() {
 		fmt.Printf("Parallel:     %d allocation(s) (slots %v)\n",
 			len(creds), slotsOf(creds))
 	}
-	fmt.Printf("TURN relay:   %s\n", creds[0].Address)
+	if *relayAddr != "" {
+		fmt.Printf("TURN relay:   %s (overridden via -relay-addr)\n", creds[0].Address)
+	} else {
+		fmt.Printf("TURN relay:   %s\n", creds[0].Address)
+	}
 	fmt.Printf("Destination:  %s\n", dstAddr)
 	fmt.Printf("Duration:     %s, payload: %d bytes\n\n", *duration, *pktSize)
 
