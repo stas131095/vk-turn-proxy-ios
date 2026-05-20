@@ -20,8 +20,16 @@ struct ContentView: View {
     @AppStorage("vkLink") private var vkLink = ""
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
+    // useWrap / wrapKeyHex kept (UI removed) so legacy backups with these
+    // fields still parse — see AppConfig backward-compat. WRAP no longer
+    // bypasses VK shape policy (replaced by useSrtp below).
     @AppStorage("useWrap") private var useWrap = false
     @AppStorage("wrapKeyHex") private var wrapKeyHex = ""
+    // useSrtp toggles the DTLS+SRTP transport (added 2026-05-20, build
+    // 115+). When on, the app must connect to a server running with the
+    // -srtp flag (typically on a separate port from the legacy DTLS
+    // listener). Default off so existing setups continue to work.
+    @AppStorage("useSrtp") private var useSrtp = false
     @AppStorage("numConnections") private var numConnections = 30
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
@@ -88,6 +96,7 @@ struct ContentView: View {
                                 useDTLS: useDTLS,
                                 useWrap: useWrap,
                                 wrapKeyHex: wrapKeyHex,
+                                useSrtp: useSrtp,
                                 numConnections: numConnections,
                                 credPoolCooldownSeconds: credPoolCooldownSeconds
                             )
@@ -207,8 +216,16 @@ struct SettingsView: View {
     @AppStorage("vkLink") private var vkLink = ""
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
+    // useWrap / wrapKeyHex kept (UI removed) so legacy backups with these
+    // fields still parse — see AppConfig backward-compat. WRAP no longer
+    // bypasses VK shape policy (replaced by useSrtp below).
     @AppStorage("useWrap") private var useWrap = false
     @AppStorage("wrapKeyHex") private var wrapKeyHex = ""
+    // useSrtp toggles the DTLS+SRTP transport (added 2026-05-20, build
+    // 115+). When on, the app must connect to a server running with the
+    // -srtp flag (typically on a separate port from the legacy DTLS
+    // listener). Default off so existing setups continue to work.
+    @AppStorage("useSrtp") private var useSrtp = false
     @AppStorage("numConnections") private var numConnections = 30
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
@@ -255,40 +272,23 @@ struct SettingsView: View {
 
                 Toggle("DTLS Obfuscation", isOn: $useDTLS)
 
-                // WRAP layer: ChaCha20-XOR every UDP packet between DTLS
-                // and TURN ChannelData so VK's TURN-relay payload classifier
-                // can't recognise DTLS+WG and tag the destination endpoint.
-                // The endpoint configured above (Proxy Server) MUST be a
-                // server running with matching -wrap and -wrap-key from the
-                // upstream cacggghp/vk-turn-proxy WRAP-aware build —
-                // without that, the DTLS handshake fails because the
-                // server-side raw bytes get XOR'd by our wrapping.
-                Toggle("Use WRAP (peer must be WRAP-aware)", isOn: $useWrap)
-
-                if useWrap {
-                    SecureField("WRAP key (64 hex chars)", text: $wrapKeyHex)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                        // Strip whitespace as the user types / pastes — paste
-                        // from clipboard often picks up leading/trailing
-                        // spaces or newlines, and a hex key has no legitimate
-                        // use for spaces inside, so silently cleaning is
-                        // safe. Without this, a stray space caused the Go
-                        // bridge to fail decoding with
-                        // "encoding/hex: invalid byte: U+0020 ' '" and
-                        // disable WRAP for the session — observed in user
-                        // report 2026-05-07. The Go bridge also strips
-                        // whitespace defensively as a backstop, but doing
-                        // it here keeps the stored value clean and avoids
-                        // a confusing reopen-Settings experience where
-                        // the SecureField has hidden whitespace inside.
-                        .onChange(of: wrapKeyHex) { newValue in
-                            let cleaned = newValue.filter { !$0.isWhitespace }
-                            if cleaned != newValue {
-                                wrapKeyHex = cleaned
-                            }
-                        }
-                }
+                // SRTP transport: frames every tunnel packet as DTLS+SRTP
+                // (RTP PayloadType 100, mimicking VP8 WebRTC video) so
+                // VK's TURN-relay content classifier sees the traffic as
+                // legitimate media and does NOT apply the per-allocation
+                // shape policy that throttles raw DTLS+WG to ~9 KB/s.
+                //
+                // Requires the peer server (Proxy Server field above) to
+                // be running with the -srtp flag — typically deployed on
+                // a separate port from the legacy DTLS+WG listener (e.g.
+                // :56004 vs :56003). Pointing this toggle at a non-SRTP
+                // server produces a clean DTLS handshake failure.
+                //
+                // Default off. Empirical 2026-05-19/20 testing shows
+                // sustained 200+ KB/s per connection with 0% loss vs
+                // ~9 KB/s on the standard DTLS+WG transport — ~25× lift
+                // for the same number of TURN allocations.
+                Toggle("Use SRTP (peer must be SRTP-aware)", isOn: $useSrtp)
 
                 // UI cap at 50 — pool size formula (ceil(N*4/10), creds.go
                 // build 73) means N=50 → 20 slots, N=64 → 26 slots, both

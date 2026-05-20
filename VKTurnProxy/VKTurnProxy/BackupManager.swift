@@ -99,7 +99,8 @@ enum BackupManager {
             // for a default of false the difference is invisible, the
             // pattern stays consistent with surrounding code.
             useWrap: (d.object(forKey: "useWrap") as? Bool) ?? false,
-            wrapKeyHex: d.string(forKey: "wrapKeyHex") ?? ""
+            wrapKeyHex: d.string(forKey: "wrapKeyHex") ?? "",
+            useSrtp: (d.object(forKey: "useSrtp") as? Bool) ?? false
         )
 
         var turnPool: CredCacheFile? = nil
@@ -223,8 +224,11 @@ enum BackupManager {
         // false / empty if the user explicitly set them that way.
         if let v = s.useWrap { d.set(v, forKey: "useWrap") }
         if let v = s.wrapKeyHex { d.set(v, forKey: "wrapKeyHex") }
+        // useSrtp: same pattern as WRAP fields — nil leaves the
+        // AppStorage default in place, non-nil writes through.
+        if let v = s.useSrtp { d.set(v, forKey: "useSrtp") }
 
-        SharedLogger.shared.log("[AppDebug] Backup: applied settings (numConnections=\(s.numConnections), cooldown=\(s.credPoolCooldownSeconds)s, useDTLS=\(s.useDTLS), useWrap=\(s.useWrap ?? false))")
+        SharedLogger.shared.log("[AppDebug] Backup: applied settings (numConnections=\(s.numConnections), cooldown=\(s.credPoolCooldownSeconds)s, useDTLS=\(s.useDTLS), useWrap=\(s.useWrap ?? false), useSrtp=\(s.useSrtp ?? false))")
 
         // creds-pool.json: write only if backup contained one. If the
         // backup has nil turnPool (e.g. user exported on a fresh install
@@ -402,6 +406,9 @@ enum BackupManager {
         d.set(s.useDTLS, forKey: "useDTLS")
         d.set(s.useWrap, forKey: "useWrap")
         d.set(s.wrapKeyHex, forKey: "wrapKeyHex")
+        // useSrtp optional in ConnectionSettings (added 2026-05-20): if
+        // absent, keep whatever the device currently has (default false).
+        if let v = s.useSrtp { d.set(v, forKey: "useSrtp") }
         if let v = s.dnsServers { d.set(v, forKey: "dnsServers") }
         if let v = s.numConnections { d.set(v, forKey: "numConnections") }
         // Truncate vkLink and peerAddress in the log so we don't dump

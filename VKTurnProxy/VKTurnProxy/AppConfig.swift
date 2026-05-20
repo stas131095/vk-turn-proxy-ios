@@ -79,10 +79,18 @@ struct AppSettings: Codable {
     /// WRAP layer (ChaCha20-XOR ChannelData payload obfuscation, see
     /// vk-turn-proxy-ios commit 1c1edc1 / branch add-client-wrap-layer).
     /// Optional for back-compat with backups exported before WRAP shipped.
+    /// NOTE 2026-05-20: WRAP no longer bypasses VK's content classifier
+    /// — use useSrtp below instead. WRAP fields retained for backward-
+    /// compat with legacy backups.
     let useWrap: Bool?
     /// 64-character hex encoding of the 32-byte WRAP shared key. Must
     /// match the server's -wrap-key. Optional for back-compat.
     let wrapKeyHex: String?
+    /// SRTP transport (DTLS+SRTP+RTP framing, see pkg/proxy/srtpwrap
+    /// and add-server-srtp-layer server branch, added 2026-05-20 build
+    /// 115+). Bypasses VK's per-allocation shape policy. Optional for
+    /// back-compat with backups exported before SRTP shipped.
+    let useSrtp: Bool?
 }
 
 // MARK: - 1-Click Connection Link
@@ -131,6 +139,10 @@ struct ConnectionSettings: Codable {
     let useDTLS: Bool
     let useWrap: Bool
     let wrapKeyHex: String
+    /// SRTP transport (added 2026-05-20). Optional for back-compat with
+    /// connection links exported before SRTP shipped — receiving device
+    /// keeps its current useSrtp value (default false) if absent.
+    let useSrtp: Bool?
     /// Optional: if absent, the importing device keeps its current
     /// dnsServers value (or the AppStorage default of "1.1.1.1" if
     /// never set). Always set on apply when present.

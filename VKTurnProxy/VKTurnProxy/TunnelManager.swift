@@ -1176,6 +1176,7 @@ class TunnelManager: ObservableObject {
             "use_udp": config.useUDP,
             "use_wrap": config.useWrap,
             "wrap_key_hex": config.wrapKeyHex,
+            "use_srtp": config.useSrtp,
             "num_conns": config.numConnections,
             "cred_pool_cooldown_seconds": config.credPoolCooldownSeconds,
             "turn_server": config.turnServerOverride ?? "",
@@ -1466,6 +1467,16 @@ struct TunnelConfig {
     // 32-byte ChaCha20 key as 64 hex chars; required when useWrap=true,
     // must match the server's -wrap-key value exactly.
     var wrapKeyHex: String = ""
+    // SRTP transport: frames tunnel traffic as DTLS+SRTP+RTP so VK's
+    // TURN-relay content classifier sees it as legitimate WebRTC media
+    // and does not apply the per-allocation shape policy. Requires the
+    // peer server (peerAddress above) to be running anton48/vk-turn-
+    // proxy add-server-srtp-layer with the -srtp flag — typically on a
+    // separate port from the legacy DTLS+WG listener. Empirical 2026-
+    // 05-19/20: sustained 200+ KB/s per conn with 0% loss; 30-conn
+    // production layout yields ~50 Mbps total tunnel throughput (vs
+    // ~2 Mbps for the standard DTLS+WG path).
+    var useSrtp: Bool = false
     // 2026-05-18 empirical: VK's new per-cred TURN allocation-rate
     // throttle (introduced ~16:00 MSK that day) applies ONLY to UDP-
     // transport allocations. 11×10 = 110 TCP-control allocations on a
