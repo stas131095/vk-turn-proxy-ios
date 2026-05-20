@@ -48,7 +48,7 @@ import (
 	"github.com/pion/logging"
 	"github.com/pion/turn/v5"
 
-	"github.com/cacggghp/vk-turn-proxy/tools/srtpwrap"
+	"github.com/cacggghp/vk-turn-proxy/pkg/proxy/srtpwrap"
 )
 
 type backupCred struct {
