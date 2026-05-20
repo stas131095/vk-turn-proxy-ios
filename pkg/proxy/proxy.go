@@ -3901,6 +3901,17 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 					log.Printf("proxy: [conn %d] SRTP send error: %v", connIdx, err)
 					return
 				}
+				// Per-conn TX byte counter, parity with the DTLS path
+				// at proxy.go:2818. Counts the pre-SRTP payload bytes
+				// (WireGuard records that came out of sendCh), not the
+				// wire bytes after RTP+SRTP framing — matches what an
+				// external observer counting WG throughput would see,
+				// and matches the DTLS path's accounting so the conn-
+				// stats tick output reads the same regardless of
+				// transport mode.
+				if connIdx >= 0 && connIdx < len(p.connTxBytes) {
+					p.connTxBytes[connIdx].Add(int64(len(pkt)))
+				}
 			}
 		}
 	}()
@@ -3955,6 +3966,15 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 					p.lastPongTimes[connIdx].Store(time.Now().Unix())
 				}
 				continue
+			}
+
+			// Per-conn RX byte counter, parity with the DTLS path
+			// at proxy.go:2874. Counted before the recvCh send so a
+			// full recvCh that causes the goroutine to bail still
+			// reflects the bytes we actually decrypted and accepted
+			// from the wire.
+			if connIdx >= 0 && connIdx < len(p.connRxBytes) {
+				p.connRxBytes[connIdx].Add(int64(n))
 			}
 
 			pkt := make([]byte, n)
@@ -4026,6 +4046,11 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		return nil, fmt.Errorf("turn allocate: %w", err)
 	}
 	allocDur := time.Since(allocStart)
+	// Surface the TURN-allocate roundtrip to the UI / Stats endpoint
+	// — same field runDTLSSession populates at proxy.go:2706, so the
+	// "TURN RTT" tile shows the most recent successful allocate
+	// duration regardless of which session type produced it.
+	p.turnRTTns.Store(int64(allocDur))
 	if err := tc.CreatePermission(p.peer); err != nil {
 		_ = relayConn.Close()
 		tc.Close()
