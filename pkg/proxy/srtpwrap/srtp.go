@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"sync"
@@ -84,7 +85,22 @@ func Client(ctx context.Context, underlay net.PacketConn, remote net.Addr) (net.
 
 	dtlsCh := make(chan []byte, 64)
 	rtpCh := make(chan []byte, 4096)
-	demuxCtx, demuxCancel := context.WithCancel(ctx)
+	// Decouple demux's ctx from caller's ctx. Production callers commonly
+	// wrap their parent ctx with a short handshake-timeout context (10s)
+	// and `cancel()` it the instant srtpwrap.Client returns — see
+	// pkg/proxy/proxy.go setupSRTPSession. If demuxCtx inherited from
+	// that ctx, the demux goroutine would die the moment handshake
+	// completed, before wrappedConn.Read could pull any post-handshake
+	// SRTP packet off rtpCh. The bug looked like "iPhone never receives
+	// server's response" but was actually "demux silently exited 1ms
+	// after handshake done, RTP packets dropped on the floor".
+	//
+	// Demux must outlive the handshake. Its lifetime is bound to
+	// wrappedConn.Close (which calls stopDemux=demuxCancel below) plus
+	// the explicit demuxCancel() calls on this function's error paths.
+	// Using context.Background() as the demux's parent makes that
+	// boundary explicit — only Close ends the demux.
+	demuxCtx, demuxCancel := context.WithCancel(context.Background())
 	go runDemuxFromPacketConn(demuxCtx, underlay, dtlsCh, rtpCh)
 
 	adapter := &packetConnAdapter{
@@ -403,7 +419,22 @@ func (a *packetConnAdapter) setDl(t time.Time) {
 			return
 		}
 		ch := a.dlCh
-		time.AfterFunc(dur, func() { close(ch) })
+		// See wrappedConn.setDl for the long explanation of the race the
+		// CAS-style check below avoids. Same bug pattern: a setDl chain
+		// closes earlier dlCh inline, then the orphan timer for that
+		// earlier ch eventually fires and double-closes.
+		time.AfterFunc(dur, func() {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			if a.dlCh != ch {
+				return
+			}
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		})
 	}
 }
 
@@ -486,11 +517,18 @@ func (c *wrappedConn) Read(b []byte) (int, error) {
 			}
 			plain, err := c.decCtx.DecryptRTP(nil, pkt, nil)
 			if err != nil {
+				// SRTP decrypt failures should be rare in steady state
+				// (would indicate key mismatch or replay-window issue).
+				// Logged as a warning so it remains visible without
+				// the per-packet noise that would result from logging
+				// every successful decrypt.
+				log.Printf("srtpwrap: wrappedConn.Read[%s]: DecryptRTP failed: %v (pkt %d bytes)", c.remote, err, len(pkt))
 				continue
 			}
 			var hdr rtp.Header
 			n, err := hdr.Unmarshal(plain)
 			if err != nil {
+				log.Printf("srtpwrap: wrappedConn.Read[%s]: rtp.Unmarshal failed: %v (plain %d bytes)", c.remote, err, len(plain))
 				continue
 			}
 			return copy(b, plain[n:]), nil
@@ -600,31 +638,78 @@ func (c *wrappedConn) setDl(t time.Time) {
 			return
 		}
 		ch := c.dlCh
-		time.AfterFunc(dur, func() { close(ch) })
+		// Capture ch by value. When the timer fires, we re-acquire the
+		// lock and verify the channel is BOTH (a) still the current
+		// deadline channel (i.e. setDl hasn't replaced it since we
+		// scheduled the timer) AND (b) not already closed. Without these
+		// checks, a sequence of setDl(t1) → setDl(t2) closes ch1 inline
+		// in setDl(t2); when the original timer for ch1 finally fires,
+		// close(ch1) panics with "close of closed channel". Observed
+		// 2026-05-20 build 121 around T+32s of every SRTP session, with
+		// the recv goroutine cycling SetReadDeadline+Read ~30s apart so
+		// the race surfaces predictably as soon as one old deadline
+		// timer outlives the next setDl call.
+		time.AfterFunc(dur, func() {
+			c.dlMu.Lock()
+			defer c.dlMu.Unlock()
+			if c.dlCh != ch {
+				return // a newer setDl has installed a different channel
+			}
+			select {
+			case <-ch:
+				// already closed (by an explicit close path)
+			default:
+				close(ch)
+			}
+		})
 	}
 }
 
 // ─── client-side demux from a single-peer PacketConn ──────────────────────
 
 func runDemuxFromPacketConn(ctx context.Context, raw net.PacketConn, dtlsCh, rtpCh chan<- []byte) {
+	// Cancellation pattern: ReadFrom blocks until a packet actually
+	// arrives. To unblock on ctx cancellation, AfterFunc sets the read
+	// deadline to "now" — the next ReadFrom returns immediately with a
+	// timeout error, the for-loop sees ctx.Err() != nil and exits.
+	//
+	// Why this matters on iOS: the previous version polled with a 500ms
+	// SetReadDeadline at the top of every loop iteration. With 30 conns
+	// idle that produced 60 forced wakeups/sec for the relayedConn read
+	// loop. iOS NetworkExtension monitors per-process CPU wakeup rate
+	// and terminates extensions that exceed its budget; build 117/118
+	// hit that ceiling at ~38s into every session, manifesting as a
+	// sudden NEVPNStatus → 1 with no graceful stopTunnel. Blocking
+	// ReadFrom with AfterFunc-driven cancellation has zero idle wakeups
+	// — the goroutine actually sleeps until a packet arrives or until
+	// the conn is being torn down. Matches the pattern legacy
+	// runDTLSSession uses on its relayConn read loop (proxy.go:2786),
+	// which never had this issue.
+	stop := context.AfterFunc(ctx, func() {
+		_ = raw.SetReadDeadline(time.Now())
+	})
+	defer stop()
+
 	buf := make([]byte, 2048)
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		_ = raw.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		n, _, err := raw.ReadFrom(buf)
 		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				continue
+			// If ctx is done, AfterFunc fired SetReadDeadline(now) to
+			// unblock us. Exit cleanly without logging.
+			if ctx.Err() != nil {
+				return
 			}
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			// likely transient — keep going so a single
-			// kernel-level write error doesn't kill the test
+			// Spurious timeout (e.g. caller called SetReadDeadline
+			// before us). Clear and retry.
+			var ne net.Error
+			if errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
+				_ = raw.SetReadDeadline(time.Time{})
+				continue
+			}
+			log.Printf("srtpwrap: client-demux: ReadFrom error: %v", err)
 			continue
 		}
 		if n == 0 {
