@@ -931,6 +931,44 @@ func wgSetLogFilePath(path *C.char) {
 		profilePath := filepath.Join(filepath.Dir(p), "vk_profile.json")
 		proxy.SetVKProfilePath(profilePath)
 		log.Printf("wgSetLogFilePath: vk_profile.json path = %s", profilePath)
+
+		// Redirect this process's stderr to the SAME vpn.log file that
+		// SharedLogger writes to. Rationale: our normal log.Printf path
+		// uses osLogWriter (doesn't touch stderr), so the only writers
+		// to stderr are the Go runtime itself (panic messages,
+		// runtime.throw, "fatal error: ...", full goroutine dumps on
+		// crash) and any C library that aborts. iOS Network Extensions
+		// get killed before any stderr line lands in os_log on a
+		// fatal-runtime path, so without this redirect we never see
+		// what Go was complaining about — the .ips file just shows
+		// runtime.raise_trampoline.abi0 at the top of the panicking
+		// thread with no message.
+		//
+		// Using vpn.log (rather than a separate panic.log) means the
+		// existing in-app "share logs" flow surfaces the panic without
+		// any UI changes — the panic dump just lands at the end of the
+		// log the user already knows how to fetch. There's a minor
+		// risk of byte-level interleaving with SharedLogger's writes
+		// since both fds write to the same file, but for diagnostic
+		// purposes it's acceptable: O_APPEND on both fds makes each
+		// write atomic up to PIPE_BUF (typically 4KB on iOS), and the
+		// per-line panic text plus goroutine-dump prefixes ("fatal
+		// error:", "goroutine N [...]") are unmistakable when grep'd
+		// out of the otherwise timestamp-prefixed log.
+		if f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+			if dupErr := unix.Dup2(int(f.Fd()), int(os.Stderr.Fd())); dupErr != nil {
+				log.Printf("wgSetLogFilePath: stderr redirect to %s failed: %v", p, dupErr)
+				_ = f.Close()
+			} else {
+				log.Printf("wgSetLogFilePath: stderr redirected to %s (pid=%d) — Go runtime panics will land in this log", p, os.Getpid())
+				// Keep f alive; the underlying fd is now duplicated
+				// onto stderr. Closing f would only close the original
+				// handle, not the dup'd stderr, so leaking f is fine.
+				_ = f
+			}
+		} else {
+			log.Printf("wgSetLogFilePath: failed to open stderr redirect target %s: %v", p, err)
+		}
 	}
 }
 
