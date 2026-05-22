@@ -144,9 +144,19 @@ struct ConnectionSettings: Codable {
     let allowedIPs: String
     let vkLink: String
     let peerAddress: String
-    let useDTLS: Bool
-    let useWrap: Bool
-    let wrapKeyHex: String
+    /// useDTLS / useWrap / wrapKeyHex made Optional in build 129. UI
+    /// toggles for both are gone (useDTLS removed build 127, useWrap
+    /// removed build 115), so admins generating links should typically
+    /// omit them and let the importer keep whatever the device already
+    /// has — useDTLS defaults to true so the legacy DTLS+WG path stays
+    /// the safe fallback; useWrap defaults to false so the importer
+    /// doesn't unintentionally turn on WRAP against a non-WRAP server.
+    /// Older quick_link.py-generated links that still set these fields
+    /// continue to apply them on import — nil semantics is purely an
+    /// additive relaxation for new link generators.
+    let useDTLS: Bool?
+    let useWrap: Bool?
+    let wrapKeyHex: String?
     /// SRTP transport (added 2026-05-20). Optional for back-compat with
     /// connection links exported before SRTP shipped — receiving device
     /// keeps its current useSrtp value (default false) if absent.
