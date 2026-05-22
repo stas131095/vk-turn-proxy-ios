@@ -91,6 +91,14 @@ struct AppSettings: Codable {
     /// 115+). Bypasses VK's per-allocation shape policy. Optional for
     /// back-compat with backups exported before SRTP shipped.
     let useSrtp: Bool?
+    /// TURN control-transport: UDP (true) vs TCP (false, default).
+    /// Surfaced as a Settings toggle in build 128. TCP-control bypasses
+    /// VK's per-cred allocation-rate throttle (introduced 2026-05-18);
+    /// UDP-control is the historical default and can be re-enabled if
+    /// the user is on a network where TCP-to-relay is blocked or much
+    /// slower. Optional for back-compat with backups exported before
+    /// this build — nil leaves the AppStorage default (false / TCP).
+    let useUDP: Bool?
 }
 
 // MARK: - 1-Click Connection Link
@@ -143,6 +151,10 @@ struct ConnectionSettings: Codable {
     /// connection links exported before SRTP shipped — receiving device
     /// keeps its current useSrtp value (default false) if absent.
     let useSrtp: Bool?
+    /// TURN control-transport UDP vs TCP (added build 128). Optional
+    /// for back-compat — receiving device keeps its current useUDP
+    /// value (default false / TCP) if absent in the link payload.
+    let useUDP: Bool?
     /// Optional: if absent, the importing device keeps its current
     /// dnsServers value (or the AppStorage default of "1.1.1.1" if
     /// never set). Always set on apply when present.

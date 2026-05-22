@@ -30,6 +30,16 @@ struct ContentView: View {
     // -srtp flag (typically on a separate port from the legacy DTLS
     // listener). Default off so existing setups continue to work.
     @AppStorage("useSrtp") private var useSrtp = false
+    // useUDP toggles TURN control transport: UDP (true) vs TCP (false,
+    // default). Surfaced in Settings build 128. TCP-control bypasses
+    // VK's per-cred allocation-rate throttle introduced 2026-05-18 —
+    // see TunnelManager.swift TunnelConfig.useUDP for the empirical
+    // numbers (0% quota errors on TCP vs ~36-58% on UDP for the same
+    // cred). Default off so users stay on the post-2026-05-18 working
+    // transport. Toggle on only if your network blocks/throttles TCP
+    // to the TURN relay and you'd rather take VK's allocation-rate
+    // hit than not connect at all.
+    @AppStorage("useUDP") private var useUDP = false
     @AppStorage("numConnections") private var numConnections = 30
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
@@ -97,6 +107,7 @@ struct ContentView: View {
                                 useWrap: useWrap,
                                 wrapKeyHex: wrapKeyHex,
                                 useSrtp: useSrtp,
+                                useUDP: useUDP,
                                 numConnections: numConnections,
                                 credPoolCooldownSeconds: credPoolCooldownSeconds
                             )
@@ -226,6 +237,16 @@ struct SettingsView: View {
     // -srtp flag (typically on a separate port from the legacy DTLS
     // listener). Default off so existing setups continue to work.
     @AppStorage("useSrtp") private var useSrtp = false
+    // useUDP toggles TURN control transport: UDP (true) vs TCP (false,
+    // default). Surfaced in Settings build 128. TCP-control bypasses
+    // VK's per-cred allocation-rate throttle introduced 2026-05-18 —
+    // see TunnelManager.swift TunnelConfig.useUDP for the empirical
+    // numbers (0% quota errors on TCP vs ~36-58% on UDP for the same
+    // cred). Default off so users stay on the post-2026-05-18 working
+    // transport. Toggle on only if your network blocks/throttles TCP
+    // to the TURN relay and you'd rather take VK's allocation-rate
+    // hit than not connect at all.
+    @AppStorage("useUDP") private var useUDP = false
     @AppStorage("numConnections") private var numConnections = 30
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
@@ -305,6 +326,19 @@ struct SettingsView: View {
                 // ~9 KB/s on the standard DTLS+WG transport — ~25× lift
                 // for the same number of TURN allocations.
                 Toggle("Use SRTP (peer must be SRTP-aware)", isOn: $useSrtp)
+
+                // TURN control transport: UDP (true) vs TCP (false /
+                // default). TCP-control bypasses VK's per-cred allocation-
+                // rate throttle introduced 2026-05-18 — empirically ~0%
+                // quota errors on TCP vs 36-58% on UDP for the same cred
+                // (see TunnelManager.swift TunnelConfig.useUDP doc block
+                // for the test numbers). Default off; only toggle on if
+                // your network blocks/throttles TCP-to-relay and you'd
+                // rather take VK's allocation-rate hit than fail to
+                // connect. Independent of the DTLS/SRTP transport choice
+                // above — controls the leg between client and TURN relay
+                // (the iOS↔relay control channel).
+                Toggle("Use UDP transport to TURN", isOn: $useUDP)
 
                 // UI cap at 50 — pool size formula (ceil(N*4/10), creds.go
                 // build 73) means N=50 → 20 slots, N=64 → 26 slots, both

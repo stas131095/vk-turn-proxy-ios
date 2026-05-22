@@ -100,7 +100,11 @@ enum BackupManager {
             // pattern stays consistent with surrounding code.
             useWrap: (d.object(forKey: "useWrap") as? Bool) ?? false,
             wrapKeyHex: d.string(forKey: "wrapKeyHex") ?? "",
-            useSrtp: (d.object(forKey: "useSrtp") as? Bool) ?? false
+            useSrtp: (d.object(forKey: "useSrtp") as? Bool) ?? false,
+            // useUDP default false matches SettingsView's @AppStorage
+            // default — TCP-control was made default in build 109 to
+            // bypass VK's per-cred allocation-rate throttle.
+            useUDP: (d.object(forKey: "useUDP") as? Bool) ?? false
         )
 
         var turnPool: CredCacheFile? = nil
@@ -227,8 +231,10 @@ enum BackupManager {
         // useSrtp: same pattern as WRAP fields — nil leaves the
         // AppStorage default in place, non-nil writes through.
         if let v = s.useSrtp { d.set(v, forKey: "useSrtp") }
+        // useUDP: same nil-preserves-default pattern.
+        if let v = s.useUDP { d.set(v, forKey: "useUDP") }
 
-        SharedLogger.shared.log("[AppDebug] Backup: applied settings (numConnections=\(s.numConnections), cooldown=\(s.credPoolCooldownSeconds)s, useDTLS=\(s.useDTLS), useWrap=\(s.useWrap ?? false), useSrtp=\(s.useSrtp ?? false))")
+        SharedLogger.shared.log("[AppDebug] Backup: applied settings (numConnections=\(s.numConnections), cooldown=\(s.credPoolCooldownSeconds)s, useDTLS=\(s.useDTLS), useWrap=\(s.useWrap ?? false), useSrtp=\(s.useSrtp ?? false), useUDP=\(s.useUDP ?? false))")
 
         // creds-pool.json: write only if backup contained one. If the
         // backup has nil turnPool (e.g. user exported on a fresh install
@@ -409,6 +415,9 @@ enum BackupManager {
         // useSrtp optional in ConnectionSettings (added 2026-05-20): if
         // absent, keep whatever the device currently has (default false).
         if let v = s.useSrtp { d.set(v, forKey: "useSrtp") }
+        // useUDP optional in ConnectionSettings (added build 128): same
+        // keep-current-on-absent semantics as useSrtp.
+        if let v = s.useUDP { d.set(v, forKey: "useUDP") }
         if let v = s.dnsServers { d.set(v, forKey: "dnsServers") }
         if let v = s.numConnections { d.set(v, forKey: "numConnections") }
         // Truncate vkLink and peerAddress in the log so we don't dump
