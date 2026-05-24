@@ -1007,8 +1007,29 @@ func wgSetTimezoneOffset(offsetSeconds C.int) {
 }
 
 func init() {
-	// Belt-and-suspenders: also set via Go in case C constructor didn't run first
-	os.Setenv("GODEBUG", "asyncpreemptoff=1")
+	// Belt-and-suspenders: also set via Go in case C constructor didn't run first.
+	//
+	// madvdontneed=1: force Go's scavenger to use MADV_DONTNEED instead of
+	// MADV_FREE when returning idle heap pages to the OS. With MADV_FREE
+	// (Go's default on Darwin since Go 1.12), pages stay mapped in the
+	// process address space — kernel may reclaim them under pressure but
+	// usually doesn't unless really needed. With MADV_DONTNEED, pages are
+	// immediately unmapped, shrinking the process's `sys` accounting.
+	//
+	// Added build 132 after build 131 soak (2026-05-24) showed
+	// debug.FreeOSMemory() periodic calls grew `heap-released` to 19 MB
+	// but `sys` stayed stuck at 41.8 MB through multiple speedtest spikes
+	// — Go was marking pages returnable but they remained mapped, so
+	// iOS jetsam (which appears to count mapped memory) still saw us
+	// near the 50 MB NE per-process limit. MADV_DONTNEED forces actual
+	// unmap so `sys` follows live working set.
+	//
+	// Trade-off: subsequent allocations on previously-freed pages cause
+	// page faults (kernel re-maps zero pages). For workloads with high
+	// reuse (our case — pion buffer reuse, scratch buffers, GC arena)
+	// this can be costly. Mitigated by Go's tcmalloc-style heap that
+	// avoids re-touching freed pages immediately.
+	os.Setenv("GODEBUG", "asyncpreemptoff=1,madvdontneed=1")
 	// Start async log file writer
 	startLogWriter()
 	// Route all Go logs to os_log so they show in Console.app
