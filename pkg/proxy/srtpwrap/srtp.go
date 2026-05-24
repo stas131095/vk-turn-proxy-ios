@@ -39,6 +39,53 @@ import (
 	"github.com/pion/srtp/v3"
 )
 
+// pktPool recycles []byte slices used to hand off freshly-read packets
+// from the demux goroutine to wrappedConn.Read (via rtpCh / dtlsCh).
+// Before this pool, every packet allocated a fresh []byte: at ~2400
+// packets/sec under a 25 Mbps SRTP-tunnel speedtest, that's ~5 MB/sec
+// of garbage generated just from this hand-off plus another 5 MB/sec
+// from the symmetric hand-off in runSRTPSession.recv (proxy.go:4157).
+// The resulting heap-alloc spikes (28 MB observed 2026-05-24 build 132
+// at 18:02:16) pushed phys_footprint past the iOS NE per-process limit
+// and triggered JETSAM_REASON_MEMORY_PERPROCESSLIMIT (RC=7 NS=1).
+//
+// 2048-byte capacity covers max expected wire-format packet (~1280 WG
+// MTU + ~22 bytes RTP/SRTP framing + ChannelData overhead + slack).
+// Slices are returned with full cap restored so Get always sees a
+// 2048-byte backing array regardless of last Get caller's reslice.
+//
+// Build 133.
+var pktPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 2048)
+	},
+}
+
+// pktPoolGet returns a slice of length n backed by a pool buffer of
+// cap 2048 (or larger via runtime growth from prior Put callers that
+// returned an enlarged buffer). Caller is responsible for pktPoolPut
+// once the slice is no longer needed.
+func pktPoolGet(n int) []byte {
+	b := pktPool.Get().([]byte)
+	if cap(b) < n {
+		// Rare: a previous caller stored a smaller buffer somehow.
+		// Allocate one big enough.
+		b = make([]byte, n)
+	}
+	return b[:n]
+}
+
+// pktPoolPut returns a slice to the pool. The slice is restored to its
+// full backing-array length before storage so subsequent Get calls
+// always see a fixed-capacity buffer.
+func pktPoolPut(b []byte) {
+	if b == nil {
+		return
+	}
+	pktPool.Put(b[:cap(b)])
+}
+
+
 const (
 	// PayloadType for the synthetic RTP wrapper. 100 is the dynamic-range
 	// value commonly assigned to VP8 in WebRTC SDP offers, so receivers
@@ -537,6 +584,10 @@ func (c *wrappedConn) Read(b []byte) (int, error) {
 				c.rxDecBuf = make([]byte, 0, len(pkt)+64)
 			}
 			plain, err := c.decCtx.DecryptRTP(c.rxDecBuf[:0], pkt, nil)
+			// pkt's encrypted payload was decrypted into c.rxDecBuf — pkt
+			// itself is no longer needed regardless of err. Return to pool
+			// before any return/continue (build 133).
+			pktPoolPut(pkt)
 			if err != nil {
 				// SRTP decrypt failures should be rare in steady state
 				// (would indicate key mismatch or replay-window issue).
@@ -773,21 +824,29 @@ func runDemuxFromPacketConn(ctx context.Context, raw net.PacketConn, dtlsCh, rtp
 		if n == 0 {
 			continue
 		}
-		pkt := make([]byte, n)
+		// pktPoolGet returns a pool-backed slice; pktPoolPut on
+		// wrappedConn.Read consumer side returns it after decrypt.
+		// Saves ~5 MB/s of GC churn under speedtest load (build 133).
+		pkt := pktPoolGet(n)
 		copy(pkt, buf[:n])
 		switch {
 		case IsDTLS(pkt[0]):
 			select {
 			case dtlsCh <- pkt:
 			case <-ctx.Done():
+				pktPoolPut(pkt)
 				return
 			}
 		case IsRTP(pkt[0]):
 			select {
 			case rtpCh <- pkt:
 			case <-ctx.Done():
+				pktPoolPut(pkt)
 				return
 			}
+		default:
+			// Not DTLS, not RTP — drop. Return slice to pool.
+			pktPoolPut(pkt)
 		}
 	}
 }

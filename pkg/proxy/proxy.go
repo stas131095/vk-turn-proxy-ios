@@ -1404,6 +1404,11 @@ func (p *Proxy) ReceivePacket(buf []byte) (int, error) {
 	select {
 	case pkt := <-p.recvCh:
 		n := copy(buf, pkt)
+		// pkt was allocated via recvPktPoolGet by the producer recv
+		// goroutine — return to pool now that contents are copied out.
+		// Saves the per-packet allocation that previously hit GC.
+		// Build 133.
+		recvPktPoolPut(pkt)
 		p.rxBytes.Add(int64(n))
 		return n, nil
 	case <-p.ctx.Done():
@@ -2495,11 +2500,12 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				}
 				continue
 			}
-			pkt := make([]byte, n)
+			pkt := recvPktPoolGet(n)
 			copy(pkt, buf[:n])
 			select {
 			case p.recvCh <- pkt:
 			case <-connCtx.Done():
+				recvPktPoolPut(pkt)
 				log.Printf("proxy: [conn %d] DTLS recv goroutine: ctx cancelled during recvCh send", connIdx)
 				return
 			}
@@ -2638,11 +2644,12 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 				return
 			}
 			p.lastRecvTime.Store(time.Now().Unix())
-			pkt := make([]byte, n)
+			pkt := recvPktPoolGet(n)
 			copy(pkt, buf[:n])
 			select {
 			case p.recvCh <- pkt:
 			case <-connCtx.Done():
+				recvPktPoolPut(pkt)
 				return
 			}
 		}
@@ -3547,6 +3554,43 @@ func isQuotaError(err error) bool {
 // network jitter before declaring a conn dead.
 var probePingMagic = []byte{0xff, 'P', 'N', 'G'}
 
+// recvPktPool recycles []byte slices used to hand off freshly-read packets
+// from the per-conn recv goroutines (runDTLSSession, runDirectSession,
+// runSRTPSession) to ReceivePacket via p.recvCh. Producer-side Get in
+// each recv goroutine, consumer-side Put in ReceivePacket after the
+// caller's buf has been filled via copy. See srtpwrap.pktPool for the
+// symmetric pool on the demux→wrappedConn.Read hand-off; together they
+// eliminate ~10 MB/sec of GC churn under speedtest load (~2400 pps × 2
+// hand-off points × ~2 KB per packet allocation = ~10 MB/sec generated
+// garbage on the SRTP path pre-pool, observed as heap-alloc spikes to
+// 28 MB and matching JETSAM_REASON_MEMORY_PERPROCESSLIMIT events in
+// builds 130-132). 2048-byte capacity covers max expected payload.
+//
+// Build 133.
+var recvPktPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 2048)
+	},
+}
+
+// recvPktPoolGet returns a slice of length n from the pool.
+func recvPktPoolGet(n int) []byte {
+	b := recvPktPool.Get().([]byte)
+	if cap(b) < n {
+		b = make([]byte, n)
+	}
+	return b[:n]
+}
+
+// recvPktPoolPut returns a slice to the pool. Restores full backing-
+// array length before storage.
+func recvPktPoolPut(b []byte) {
+	if b == nil {
+		return
+	}
+	recvPktPool.Put(b[:cap(b)])
+}
+
 const (
 	probeInterval       = 30 * time.Second
 	probeStaleThreshold = 120 * time.Second
@@ -4154,11 +4198,12 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 				p.connRxBytes[connIdx].Add(int64(n))
 			}
 
-			pkt := make([]byte, n)
+			pkt := recvPktPoolGet(n)
 			copy(pkt, buf[:n])
 			select {
 			case p.recvCh <- pkt:
 			case <-connCtx.Done():
+				recvPktPoolPut(pkt)
 				log.Printf("proxy: [conn %d] SRTP recv goroutine: ctx cancelled during recvCh send", connIdx)
 				return
 			}
