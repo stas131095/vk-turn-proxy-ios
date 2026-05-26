@@ -27,20 +27,41 @@ static void go_os_log(const char *msg) {
 	os_log(log, "%{public}s", msg);
 }
 
-// Read this process's phys_footprint via the Mach task_info API.
+// Memory breakdown from Mach task_info(TASK_VM_INFO_DATA). Single
+// kernel call returns all fields atomically (same snapshot moment) so
+// Go side gets a coherent picture rather than separate calls per
+// field. Returns all-zero struct on failure (caller treats as
+// unavailable / skips logging).
+//
 // phys_footprint is the SAME number iOS jetsam evaluates against the
-// extension memory budget — much more reliable than runtime.MemStats.Sys
-// (which is virtual address space mapped) for predicting jetsam.
-// Returns 0 on failure (caller treats as "unknown" / skips logging).
-static uint64_t go_get_phys_footprint(void) {
+// per-process NE memory budget. The internal/external/reusable/
+// compressed breakdown distinguishes Go-side from non-Go memory growth
+// — added 2026-05-26 (build 138) after observing phys_footprint
+// silently grow 22→50 MB in <50s with no log activity (jetsam at
+// 16:26:45), which the Go-only memstats couldn't explain.
+typedef struct {
+	uint64_t phys_footprint;
+	uint64_t internal;
+	uint64_t external;
+	uint64_t reusable;
+	uint64_t compressed;
+} go_vm_stats_t;
+
+static go_vm_stats_t go_get_vm_stats(void) {
 	task_vm_info_data_t info;
 	mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+	go_vm_stats_t r = {0, 0, 0, 0, 0};
 	kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO,
 	                             (task_info_t)&info, &count);
 	if (kr != KERN_SUCCESS) {
-		return 0;
+		return r;
 	}
-	return (uint64_t)info.phys_footprint;
+	r.phys_footprint = (uint64_t)info.phys_footprint;
+	r.internal       = (uint64_t)info.internal;
+	r.external       = (uint64_t)info.external;
+	r.reusable       = (uint64_t)info.reusable;
+	r.compressed     = (uint64_t)info.compressed;
+	return r;
 }
 */
 import "C"
@@ -1112,15 +1133,26 @@ func init() {
 	log.Printf("bridge: scheduled periodic debug.FreeOSMemory() every 60s (build 131)")
 
 	// Wire the proxy's memstats logger to read this process's
-	// phys_footprint via Mach task_info (see go_get_phys_footprint
-	// in the cgo preamble). On iOS, jetsam evaluates phys_footprint
-	// against the extension memory budget — runtime.MemStats.Sys
-	// alone overstates the resident footprint because Go-released
-	// pages stay in the address space until the kernel reclaims
-	// them under pressure. Without this hook the memstats line shows
-	// "rss=n/a"; with it, we can see the actual jetsam input number.
-	proxy.PhysFootprintFn = func() uint64 {
-		return uint64(C.go_get_phys_footprint())
+	// task_vm_info breakdown via the Mach task_info bridge (see
+	// go_get_vm_stats in the cgo preamble). Single kernel call per
+	// memstats tick returns phys_footprint + internal/external/
+	// reusable/compressed pages atomically. phys_footprint is what
+	// iOS jetsam evaluates; the breakdown distinguishes Go-side from
+	// non-Go memory growth so we can attribute spikes when
+	// runtime.MemStats alone gives an incomplete picture.
+	//
+	// Replaces the old proxy.PhysFootprintFn (which returned only
+	// phys_footprint as a single uint64) — see proxy.TaskVMInfo doc
+	// for field semantics.
+	proxy.TaskVMInfoFn = func() proxy.TaskVMInfo {
+		r := C.go_get_vm_stats()
+		return proxy.TaskVMInfo{
+			PhysFootprint: uint64(r.phys_footprint),
+			Internal:      uint64(r.internal),
+			External:      uint64(r.external),
+			Reusable:      uint64(r.reusable),
+			Compressed:    uint64(r.compressed),
+		}
 	}
 }
 

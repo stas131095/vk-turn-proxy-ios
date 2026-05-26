@@ -1258,8 +1258,10 @@ func (p *Proxy) runDiagnosticHeartbeat(ctx context.Context, window, interval tim
 			var ms runtime.MemStats
 			runtime.ReadMemStats(&ms)
 			rss := "n/a"
-			if PhysFootprintFn != nil {
-				rss = fmt.Sprintf("%.1fMB", float64(PhysFootprintFn())/1024/1024)
+			if TaskVMInfoFn != nil {
+				if vm := TaskVMInfoFn(); vm.PhysFootprint > 0 {
+					rss = fmt.Sprintf("%.1fMB", float64(vm.PhysFootprint)/1024/1024)
+				}
 			}
 			log.Printf("proxy: HEARTBEAT t+%s rss=%s sys=%.1fMB goroutines=%d active-conns=%d sendCh=%d/%d recvCh=%d/%d tx=%d rx=%d",
 				time.Since(p.startedAt).Round(time.Second),
@@ -3097,54 +3099,112 @@ func (p *Proxy) dumpConnStats(prevTx, prevRx []int64, prevTime time.Time, label 
 		humanBytes(int64(float64(rows[0].rx)/dur)))
 }
 
-// PhysFootprintFn, if set by the embedding application, returns the
-// process's current phys_footprint in bytes — the SAME number iOS jetsam
-// evaluates against the NetworkExtension memory budget. On iOS this is
-// wired up via the C bridge calling task_info(TASK_VM_INFO).
+// TaskVMInfo carries the iOS-side process memory accounting fields
+// pulled from Mach task_info(TASK_VM_INFO_DATA). All values in bytes.
 //
-// runtime.MemStats.Sys reports the bytes Go has *mapped* from the OS,
-// which on Darwin overstates the resident footprint: madvise(MADV_FREE_
-// REUSABLE) marks pages reclaimable but doesn't immediately reduce RSS,
-// so Sys can stay at a high-water mark indefinitely while the kernel-
-// visible footprint is much lower. phys_footprint cuts through that
-// ambiguity by reporting what jetsam actually sees.
+// Field semantics:
+//   - PhysFootprint: what iOS jetsam evaluates against the NE per-process
+//     memory budget (~50 MB hard cap). The headline number — same as
+//     the old `PhysFootprintFn` returned.
+//   - Internal: private/anonymous resident pages — Go heap, Swift heap,
+//     kernel mbufs attributed to the process. Growth here without a
+//     corresponding Go `sys` rise points at non-Go allocation
+//     (Swift host code, CFNetwork, NEPacketTunnelProvider framework,
+//     mbuf clusters for in-flight TUN traffic).
+//   - External: file-backed mappings — binary text, frameworks, dyld.
+//     Should be roughly stable; sharp changes hint framework
+//     load/unload (rare in a long-running NE).
+//   - Reusable: pages marked MADV_FREE'd (kernel can reclaim them
+//     without IO). Go's `heap-released` should be a subset
+//     (Go releases idle heap this way). If Reusable >> heap-released,
+//     something else is also freeing pages.
+//   - Compressed: kernel-compressed (swapped) pages. Growth here means
+//     system-wide pressure pushed our pages out of physical RAM into
+//     compressed swap. Often a sign other apps are crowding us.
+//
+// Added 2026-05-26 (build 138) for finer-grained jetsam attribution
+// after we observed phys_footprint silently growing ~28 MB in <50s
+// during pure idleness (2026-05-26 16:26:45 kill) with no visible
+// log activity — the standard memstats line couldn't tell us whether
+// the growth was Go-side or non-Go.
+type TaskVMInfo struct {
+	PhysFootprint uint64
+	Internal      uint64
+	External      uint64
+	Reusable      uint64
+	Compressed    uint64
+}
+
+// TaskVMInfoFn, if set by the embedding application, returns the
+// current process's task_vm_info breakdown. On iOS this is wired up
+// via the C bridge calling task_info(TASK_VM_INFO_DATA). Single call
+// per sample so all fields come from the same atomic kernel snapshot.
+//
+// PhysFootprint is the SAME number iOS jetsam evaluates against the
+// NE per-process memory budget. runtime.MemStats.Sys reports only
+// Go-side allocation — on Darwin it overstates the resident footprint
+// because madvise(MADV_FREE_REUSABLE) marks pages reclaimable but
+// doesn't immediately reduce RSS, so Sys stays at a high-water mark.
+// PhysFootprint cuts through that ambiguity, and the Internal/External/
+// Reusable/Compressed breakdown distinguishes Go from non-Go drivers.
 //
 // Set to nil = unavailable, in which case the memstats logger writes
-// "rss=n/a". No global lock — set once at startup before the loop runs.
-var PhysFootprintFn func() uint64
+// "rss=n/a" and omits the breakdown fields. No global lock — set
+// once at startup before the loop runs.
+var TaskVMInfoFn func() TaskVMInfo
 
-// logMemStatsLoop ticks every 60s and emits one runtime.MemStats line
-// per tick. Diagnostic for the Type E "silent extension kill" failure
-// mode where iOS jetsam terminates the NetworkExtension without
-// warning when the process approaches the ~50 MB hard memory budget.
+// logMemStatsLoop ticks every 10s (was 60s pre-build-138 — bumped for
+// finer-grained jetsam-spike attribution after observing phys_footprint
+// silently growing 22→50 MB in <50s on 2026-05-26 16:26:45 between
+// two 60s samples, leaving us blind to the spike shape) and emits
+// one runtime.MemStats + task_vm_info line per tick. Diagnostic for
+// the "silent extension kill" failure mode where iOS jetsam terminates
+// the NetworkExtension without warning when the process approaches
+// the ~50 MB hard per-process memory budget.
 //
 // Output format (one line per tick):
 //
-//	memstats rss=23.4 MB sys=46.1 MB heap-alloc=12.1 MB heap-inuse=14.2 MB
-//	  heap-idle=22.3 MB heap-released=18.0 MB stack=6.0 MB
-//	  heap-objects=24813 goroutines=312 numGC=42
+//	memstats rss=23.4 MB vm-internal=18.2 MB vm-external=4.1 MB
+//	  vm-reusable=15.0 MB vm-compressed=2.3 MB sys=46.1 MB
+//	  heap-alloc=12.1 MB heap-inuse=14.2 MB heap-idle=22.3 MB
+//	  heap-released=18.0 MB stack=6.0 MB heap-objects=24813
+//	  goroutines=312 numGC=42
 //
 // What to look for:
+//
+// Process-level (from Mach task_vm_info, full-process accounting):
 //   - rss:            phys_footprint via Mach task_info — what iOS
 //                     jetsam actually evaluates. The headline number;
-//                     "n/a" if PhysFootprintFn isn't wired up.
-//   - sys:            bytes Go mapped from the OS. Useful as a ceiling,
-//                     but on Darwin can overstate by 10-20 MB because
-//                     released pages stay in the address space until
-//                     pressure forces reclaim.
+//                     "n/a" if TaskVMInfoFn isn't wired up.
+//   - vm-internal:    private/anonymous resident pages — Go heap +
+//                     Swift heap + kernel mbufs + framework state.
+//                     Growth here without Go `sys` rising points at
+//                     non-Go allocation (CFNetwork, mbufs, Swift host).
+//   - vm-external:    file-backed mappings — binary, frameworks, dyld.
+//                     Should be roughly stable; sharp changes hint
+//                     framework load/unload.
+//   - vm-reusable:    pages MADV_FREE'd (kernel can reclaim). Go's
+//                     heap-released is a subset. If vm-reusable >>
+//                     heap-released, something non-Go is also freeing.
+//   - vm-compressed:  kernel-compressed (swapped) pages. Growth = we
+//                     got pushed into compressed swap due to system-
+//                     wide pressure (often other apps crowding us).
+//
+// Go runtime (from runtime.MemStats, Go-only accounting):
+//   - sys:            bytes Go mapped from the OS. On Darwin overstates
+//                     resident by 10-20 MB because released pages stay
+//                     in the address space until kernel reclaim.
 //   - heap-alloc:     bytes of currently-live heap objects.
 //   - heap-inuse:     in-use spans (>= heap-alloc; gap is fragmentation
 //                     or retained-but-not-live within active spans).
 //   - heap-idle:      bytes in idle (unused) spans, candidates for
 //                     return-to-OS.
 //   - heap-released:  bytes Go has explicitly released to the OS via
-//                     madvise. If rss << sys, this is where the
-//                     difference lives. heap-released growing alongside
-//                     allocation churn = scavenger working; heap-released
-//                     stuck at zero while sys climbs = scavenger lazy.
-//   - stack:          total stack memory (with hundreds of goroutines
-//                     and 8 KB initial stacks each, this is in the MB
-//                     range and not affected by GOMEMLIMIT).
+//                     madvise. heap-released growing alongside churn
+//                     = scavenger working; stuck at zero while sys
+//                     climbs = scavenger lazy.
+//   - stack:          total stack memory (NumConns × per-conn goroutines
+//                     × 8 KB initial). Not affected by GOMEMLIMIT.
 //   - heap-objects:   count of live objects (rises with allocation
 //                     leaks even when alloc bytes look stable).
 //   - goroutines:     leak indicator; should stabilise at roughly
@@ -3152,11 +3212,20 @@ var PhysFootprintFn func() uint64
 //   - numGC:          GC cycle count; high deltas between ticks mean
 //                     heavy alloc churn even if heap-alloc is steady.
 //
+// Correlation playbook for jetsam attribution:
+//   - rss rising + sys rising together → Go-side allocation. Look at
+//     heap-alloc, heap-objects, stack for the source.
+//   - rss rising + sys flat → non-Go allocation. Check vm-internal
+//     delta (probably the same magnitude as rss delta). If so, it's
+//     Swift / framework / mbuf accumulation we can't see from Go.
+//   - vm-compressed rising → system memory pressure, not our fault.
+//     Check for unrelated jetsam events in sysdiagnose PowerLog.
+//
 // Final dump on shutdown captures the moment-of-death snapshot in
 // the same place — useful when comparing pre-kill state across
-// multiple Type E incidents.
+// multiple jetsam incidents.
 func (p *Proxy) logMemStatsLoop(ctx context.Context) {
-	const interval = 60 * time.Second
+	const interval = 10 * time.Second
 
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
@@ -3165,14 +3234,36 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
 		rssStr := "n/a"
-		if PhysFootprintFn != nil {
-			if rss := PhysFootprintFn(); rss > 0 {
-				rssStr = humanBytes(int64(rss))
+		internalStr := "n/a"
+		externalStr := "n/a"
+		reusableStr := "n/a"
+		compressedStr := "n/a"
+		if TaskVMInfoFn != nil {
+			vm := TaskVMInfoFn()
+			if vm.PhysFootprint > 0 {
+				rssStr = humanBytes(int64(vm.PhysFootprint))
 			}
+			if vm.Internal > 0 {
+				internalStr = humanBytes(int64(vm.Internal))
+			}
+			if vm.External > 0 {
+				externalStr = humanBytes(int64(vm.External))
+			}
+			if vm.Reusable > 0 {
+				reusableStr = humanBytes(int64(vm.Reusable))
+			}
+			// Compressed legitimately can be zero (no swap pressure yet),
+			// in which case we still want to log "0 B" rather than "n/a"
+			// to distinguish "we measured zero" from "no measurement".
+			compressedStr = humanBytes(int64(vm.Compressed))
 		}
-		log.Printf("proxy: memstats %s rss=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d",
 			label,
 			rssStr,
+			internalStr,
+			externalStr,
+			reusableStr,
+			compressedStr,
 			humanBytes(int64(ms.Sys)),
 			humanBytes(int64(ms.HeapAlloc)),
 			humanBytes(int64(ms.HeapInuse)),
