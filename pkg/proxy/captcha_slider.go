@@ -9,6 +9,8 @@ import (
 	"image/color"
 	_ "image/jpeg"
 	"log"
+	"math"
+	mathrand "math/rand"
 	neturl "net/url"
 	"sort"
 	"strconv"
@@ -26,15 +28,15 @@ type vkReqFunc func(method, postData string) (map[string]interface{}, error)
 
 type sliderCaptchaContent struct {
 	Image    image.Image
-	Size     int    // grid NxN
-	Steps    []int  // swap pairs
-	Attempts int    // max submit attempts
+	Size     int   // grid NxN
+	Steps    []int // swap pairs
+	Attempts int   // max submit attempts
 }
 
 type sliderCandidate struct {
 	Index       int
 	ActiveSteps []int
-	Score       int64
+	Score       int64 // consensus rank (lower = better); for logging
 }
 
 // solveSliderCaptcha attempts to solve a VK slider captcha automatically.
@@ -87,7 +89,11 @@ func solveSliderCaptcha(
 		content.Image.Bounds().Dx(), content.Image.Bounds().Dy(),
 		content.Size, len(content.Steps)/2, content.Attempts)
 
-	// Rank candidate positions by pixel border continuity
+	// Rank candidate permutations by the v2 3-metric consensus (luma seam +
+	// RGB seam + text-band-weighted seam). Ported from amurcanov's
+	// captcha_v2_slider.go rankSliderGuessesV2 (descends, like our old
+	// solver, from Moroka8/cacggghp PR #162 but upgraded). Best = lowest
+	// consensus rank.
 	candidates, err := rankSliderCandidates(content.Image, content.Size, content.Steps)
 	if err != nil {
 		return "", fmt.Errorf("slider rank: %w", err)
@@ -103,14 +109,16 @@ func solveSliderCaptcha(
 	// Try each candidate
 	for i := 0; i < maxTries; i++ {
 		c := candidates[i]
-		log.Printf("slider: guess %d/%d position=%d score=%d", i+1, maxTries, c.Index, c.Score)
+		log.Printf("slider: guess %d/%d position=%d consensus=%d", i+1, maxTries, c.Index, c.Score)
 
 		answer, err := encodeSliderAnswer(c.ActiveSteps)
 		if err != nil {
 			return "", err
 		}
 
-		// Generate slider cursor (simulates drag from left to position)
+		// Human-like Bézier cursor path (v2). Simulates the drag with start
+		// jitter → curved transit → approach → settle, vs our old 12-point
+		// straight line. Ported from amurcanov buildSliderCursorV2.
 		cursor := generateSliderCursor(c.Index, len(candidates))
 
 		checkData := baseParams + fmt.Sprintf(
@@ -397,42 +405,146 @@ func encodeSliderAnswer(activeSteps []int) (string, error) {
 	return base64.StdEncoding.EncodeToString(data), nil
 }
 
-// rankSliderCandidates analyzes each candidate permutation and ranks by
-// pixel border continuity (lower score = better match = more likely correct).
+// rankSliderCandidates ranks each candidate permutation by a 3-metric
+// consensus, ported from amurcanov's captcha_v2_slider.go rankSliderGuessesV2.
+//
+// Two-stage so the (more expensive) RGB+text metrics only run on the most
+// promising candidates:
+//   - Stage 1: luma seam-continuity for ALL candidates → luma rank.
+//   - Stage 2: the top ≤12 by luma → RGB seam score + a text-band-weighted
+//     seam score (a Gaussian bump around the 3 horizontal text stripes at
+//     0.2/0.5/0.8 of image height, on the blue channel where VK's overlaid
+//     text contrasts most) → RGB rank + text rank.
+//   - Consensus rank = lumaRank + (rgbRank + textRank for stage-2, else
+//     +candidateCount). Lower = better.
+//
+// Computed SEQUENTIALLY (amurcanov parallelizes stage 2 with a worker pool;
+// we don't — the image is tiny and ≤12 candidates, and the iOS NetworkExtension
+// is memory-constrained, so avoiding transient goroutines/channels is safer).
+//
+// Reuses our buildSliderActiveSteps / buildSliderTileMapping / sliderTileRect
+// (byte-identical to amurcanov's activeSwapsForIndexV2 / applySliderSwapsV2 /
+// sliderTileRect). The seam scorers sample the ORIGINAL image through the
+// mapping on the fly (no per-candidate render), like amurcanov's v2.
 func rankSliderCandidates(img image.Image, gridSize int, swaps []int) ([]sliderCandidate, error) {
 	candidateCount := len(swaps) / 2
 	if candidateCount == 0 {
 		return nil, fmt.Errorf("no candidates")
 	}
 
-	candidates := make([]sliderCandidate, 0, candidateCount)
-	for idx := 1; idx <= candidateCount; idx++ {
-		activeSteps := buildSliderActiveSteps(swaps, idx)
-		mapping, err := buildSliderTileMapping(gridSize, activeSteps)
-		if err != nil {
-			return nil, err
-		}
-
-		rendered, err := renderSliderCandidate(img, gridSize, mapping)
-		if err != nil {
-			return nil, err
-		}
-
-		score := scoreRenderedSliderImage(rendered, gridSize)
-		candidates = append(candidates, sliderCandidate{
-			Index:       idx,
-			ActiveSteps: activeSteps,
-			Score:       score,
-		})
+	type scored struct {
+		index       int
+		activeSteps []int
+		luma        int64
+		rgb         int64
+		text        float64
+		consensus   int
 	}
 
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].Score == candidates[j].Score {
-			return candidates[i].Index < candidates[j].Index
+	all := make([]scored, candidateCount)
+	for idx := 1; idx <= candidateCount; idx++ {
+		active := buildSliderActiveSteps(swaps, idx)
+		mapping, err := buildSliderTileMapping(gridSize, active)
+		if err != nil {
+			return nil, err
 		}
-		return candidates[i].Score < candidates[j].Score
+		all[idx-1] = scored{
+			index:       idx,
+			activeSteps: active,
+			luma:        seamScoreLumaV2(img, gridSize, mapping),
+		}
+	}
+
+	// Stage 1: luma rank over all candidates (lumaOrder holds positions in `all`).
+	lumaOrder := make([]int, candidateCount)
+	for i := range lumaOrder {
+		lumaOrder[i] = i
+	}
+	sort.SliceStable(lumaOrder, func(i, j int) bool {
+		a, b := all[lumaOrder[i]], all[lumaOrder[j]]
+		if a.luma == b.luma {
+			return a.index < b.index
+		}
+		return a.luma < b.luma
+	})
+	lumaRank := make(map[int]int, candidateCount)
+	for rank, pos := range lumaOrder {
+		lumaRank[all[pos].index] = rank
+	}
+
+	// Stage 2: top ≤12 by luma → RGB + text seam scores.
+	stage2Count := candidateCount
+	if stage2Count > 12 {
+		stage2Count = 12
+	}
+	stage2Pos := make([]int, 0, stage2Count)
+	stage2Set := make(map[int]bool, stage2Count)
+	for i := 0; i < stage2Count; i++ {
+		pos := lumaOrder[i]
+		stage2Pos = append(stage2Pos, pos)
+		stage2Set[all[pos].index] = true
+		mapping, err := buildSliderTileMapping(gridSize, all[pos].activeSteps)
+		if err != nil {
+			return nil, err
+		}
+		all[pos].rgb, all[pos].text = seamScoreRGBTextV2(img, gridSize, mapping)
+	}
+
+	rgbOrder := append([]int(nil), stage2Pos...)
+	sort.SliceStable(rgbOrder, func(i, j int) bool {
+		a, b := all[rgbOrder[i]], all[rgbOrder[j]]
+		if a.rgb == b.rgb {
+			return a.index < b.index
+		}
+		return a.rgb < b.rgb
+	})
+	rgbRank := make(map[int]int, len(rgbOrder))
+	for rank, pos := range rgbOrder {
+		rgbRank[all[pos].index] = rank
+	}
+
+	textOrder := append([]int(nil), stage2Pos...)
+	sort.SliceStable(textOrder, func(i, j int) bool {
+		a, b := all[textOrder[i]], all[textOrder[j]]
+		if a.text == b.text {
+			return a.index < b.index
+		}
+		return a.text < b.text
+	})
+	textRank := make(map[int]int, len(textOrder))
+	for rank, pos := range textOrder {
+		textRank[all[pos].index] = rank
+	}
+
+	// Consensus rank.
+	for i := range all {
+		c := lumaRank[all[i].index]
+		if stage2Set[all[i].index] {
+			c += rgbRank[all[i].index] + textRank[all[i].index]
+		} else {
+			c += candidateCount
+		}
+		all[i].consensus = c
+	}
+
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].consensus != all[j].consensus {
+			return all[i].consensus < all[j].consensus
+		}
+		if all[i].luma != all[j].luma {
+			return all[i].luma < all[j].luma
+		}
+		return all[i].index < all[j].index
 	})
 
+	candidates := make([]sliderCandidate, candidateCount)
+	for i, s := range all {
+		candidates[i] = sliderCandidate{
+			Index:       s.index,
+			ActiveSteps: s.activeSteps,
+			Score:       int64(s.consensus),
+		}
+	}
 	return candidates, nil
 }
 
@@ -470,65 +582,6 @@ func buildSliderTileMapping(gridSize int, activeSteps []int) ([]int, error) {
 	return mapping, nil
 }
 
-func renderSliderCandidate(img image.Image, gridSize int, mapping []int) (*image.RGBA, error) {
-	tileCount := gridSize * gridSize
-	if len(mapping) != tileCount {
-		return nil, fmt.Errorf("mapping length %d != %d", len(mapping), tileCount)
-	}
-
-	bounds := img.Bounds()
-	rendered := image.NewRGBA(bounds)
-	for dstIdx, srcIdx := range mapping {
-		srcRect := sliderTileRect(bounds, gridSize, srcIdx)
-		dstRect := sliderTileRect(bounds, gridSize, dstIdx)
-		copyTile(rendered, dstRect, img, srcRect)
-	}
-	return rendered, nil
-}
-
-func scoreRenderedSliderImage(img image.Image, gridSize int) int64 {
-	bounds := img.Bounds()
-	var score int64
-
-	// Horizontal borders (left tile right edge vs right tile left edge)
-	for row := 0; row < gridSize; row++ {
-		for col := 0; col < gridSize-1; col++ {
-			leftRect := sliderTileRect(bounds, gridSize, row*gridSize+col)
-			rightRect := sliderTileRect(bounds, gridSize, row*gridSize+col+1)
-			height := leftRect.Dy()
-			if h := rightRect.Dy(); h < height {
-				height = h
-			}
-			for y := 0; y < height; y++ {
-				score += pixelDiff(
-					img.At(leftRect.Max.X-1, leftRect.Min.Y+y),
-					img.At(rightRect.Min.X, rightRect.Min.Y+y),
-				)
-			}
-		}
-	}
-
-	// Vertical borders (top tile bottom edge vs bottom tile top edge)
-	for row := 0; row < gridSize-1; row++ {
-		for col := 0; col < gridSize; col++ {
-			topRect := sliderTileRect(bounds, gridSize, row*gridSize+col)
-			bottomRect := sliderTileRect(bounds, gridSize, (row+1)*gridSize+col)
-			width := topRect.Dx()
-			if w := bottomRect.Dx(); w < width {
-				width = w
-			}
-			for x := 0; x < width; x++ {
-				score += pixelDiff(
-					img.At(topRect.Min.X+x, topRect.Max.Y-1),
-					img.At(bottomRect.Min.X+x, bottomRect.Min.Y),
-				)
-			}
-		}
-	}
-
-	return score
-}
-
 func sliderTileRect(bounds image.Rectangle, gridSize, index int) image.Rectangle {
 	row := index / gridSize
 	col := index % gridSize
@@ -539,53 +592,274 @@ func sliderTileRect(bounds image.Rectangle, gridSize, index int) image.Rectangle
 	return image.Rect(x0, y0, x1, y1)
 }
 
-func copyTile(dst *image.RGBA, dstRect image.Rectangle, src image.Image, srcRect image.Rectangle) {
-	dw, dh := dstRect.Dx(), dstRect.Dy()
-	sw, sh := srcRect.Dx(), srcRect.Dy()
-	for y := 0; y < dh; y++ {
-		sy := srcRect.Min.Y + y*sh/dh
-		for x := 0; x < dw; x++ {
-			sx := srcRect.Min.X + x*sw/dw
-			dst.Set(dstRect.Min.X+x, dstRect.Min.Y+y, src.At(sx, sy))
+// ── v2 seam scorers (ported from amurcanov captcha_v2_slider.go) ───────────
+
+// seamScoreLumaV2 sums the luminance discontinuity across every horizontal
+// and vertical tile seam, sampling the original image through `mapping`.
+// Lower = tiles fit better = more likely the correct permutation.
+func seamScoreLumaV2(img image.Image, gridSize int, mapping []int) int64 {
+	bounds := img.Bounds()
+	var score int64
+	for row := 0; row < gridSize; row++ {
+		for col := 0; col < gridSize-1; col++ {
+			leftIdx := row*gridSize + col
+			rightIdx := leftIdx + 1
+			leftDst := sliderTileRect(bounds, gridSize, leftIdx)
+			rightDst := sliderTileRect(bounds, gridSize, rightIdx)
+			leftSrc := sliderTileRect(bounds, gridSize, mapping[leftIdx])
+			rightSrc := sliderTileRect(bounds, gridSize, mapping[rightIdx])
+			h := leftDst.Dy()
+			if rightDst.Dy() < h {
+				h = rightDst.Dy()
+			}
+			for y := 0; y < h; y++ {
+				yy := leftDst.Min.Y + y
+				a := sampleLumaMappedV2(img, leftDst, leftSrc, leftDst.Max.X-1, yy)
+				b := sampleLumaMappedV2(img, rightDst, rightSrc, rightDst.Min.X, yy)
+				score += int64(absIntV2(int(a) - int(b)))
+			}
 		}
 	}
+	for row := 0; row < gridSize-1; row++ {
+		for col := 0; col < gridSize; col++ {
+			topIdx := row*gridSize + col
+			bottomIdx := (row+1)*gridSize + col
+			topDst := sliderTileRect(bounds, gridSize, topIdx)
+			bottomDst := sliderTileRect(bounds, gridSize, bottomIdx)
+			topSrc := sliderTileRect(bounds, gridSize, mapping[topIdx])
+			bottomSrc := sliderTileRect(bounds, gridSize, mapping[bottomIdx])
+			w := topDst.Dx()
+			if bottomDst.Dx() < w {
+				w = bottomDst.Dx()
+			}
+			for x := 0; x < w; x++ {
+				xx := topDst.Min.X + x
+				a := sampleLumaMappedV2(img, topDst, topSrc, xx, topDst.Max.Y-1)
+				b := sampleLumaMappedV2(img, bottomDst, bottomSrc, xx, bottomDst.Min.Y)
+				score += int64(absIntV2(int(a) - int(b)))
+			}
+		}
+	}
+	return score
 }
 
+// seamScoreRGBTextV2 returns (rgbScore, textScore). rgbScore is the full-RGB
+// seam discontinuity; textScore is the blue-channel seam discontinuity weighted
+// by a Gaussian bump around the 3 horizontal text stripes (0.2/0.5/0.8 of
+// height) where VK's overlaid challenge text lives — so a permutation that
+// aligns the text reads as a much better fit.
+func seamScoreRGBTextV2(img image.Image, gridSize int, mapping []int) (int64, float64) {
+	bounds := img.Bounds()
+	height := float64(bounds.Dy())
+	textCenters := []float64{
+		float64(bounds.Min.Y) + 0.2*height,
+		float64(bounds.Min.Y) + 0.5*height,
+		float64(bounds.Min.Y) + 0.8*height,
+	}
+	sigma := height * 0.14
+	if sigma < 1.0 {
+		sigma = 1.0
+	}
+	weight := func(y int) float64 {
+		yf := float64(y)
+		best := absFloatV2(yf - textCenters[0])
+		for i := 1; i < len(textCenters); i++ {
+			d := absFloatV2(yf - textCenters[i])
+			if d < best {
+				best = d
+			}
+		}
+		return 1 + 3*math.Exp(-(best*best)/(2*sigma*sigma))
+	}
+
+	var rgbScore int64
+	var textScore float64
+	for row := 0; row < gridSize; row++ {
+		for col := 0; col < gridSize-1; col++ {
+			leftIdx := row*gridSize + col
+			rightIdx := leftIdx + 1
+			leftDst := sliderTileRect(bounds, gridSize, leftIdx)
+			rightDst := sliderTileRect(bounds, gridSize, rightIdx)
+			leftSrc := sliderTileRect(bounds, gridSize, mapping[leftIdx])
+			rightSrc := sliderTileRect(bounds, gridSize, mapping[rightIdx])
+			h := leftDst.Dy()
+			if rightDst.Dy() < h {
+				h = rightDst.Dy()
+			}
+			for y := 0; y < h; y++ {
+				yy := leftDst.Min.Y + y
+				l := sampleColorMappedV2(img, leftDst, leftSrc, leftDst.Max.X-1, yy)
+				r := sampleColorMappedV2(img, rightDst, rightSrc, rightDst.Min.X, yy)
+				rgbScore += pixelDiff(l, r)
+				_, _, lb, _ := l.RGBA()
+				_, _, rb, _ := r.RGBA()
+				textScore += weight(yy) * float64(absIntV2(int(lb>>8)-int(rb>>8)))
+			}
+		}
+	}
+	for row := 0; row < gridSize-1; row++ {
+		for col := 0; col < gridSize; col++ {
+			topIdx := row*gridSize + col
+			bottomIdx := (row+1)*gridSize + col
+			topDst := sliderTileRect(bounds, gridSize, topIdx)
+			bottomDst := sliderTileRect(bounds, gridSize, bottomIdx)
+			topSrc := sliderTileRect(bounds, gridSize, mapping[topIdx])
+			bottomSrc := sliderTileRect(bounds, gridSize, mapping[bottomIdx])
+			w := topDst.Dx()
+			if bottomDst.Dx() < w {
+				w = bottomDst.Dx()
+			}
+			for x := 0; x < w; x++ {
+				xx := topDst.Min.X + x
+				t := sampleColorMappedV2(img, topDst, topSrc, xx, topDst.Max.Y-1)
+				b := sampleColorMappedV2(img, bottomDst, bottomSrc, xx, bottomDst.Min.Y)
+				rgbScore += pixelDiff(t, b)
+				_, _, tb, _ := t.RGBA()
+				_, _, bb, _ := b.RGBA()
+				textScore += 0.65 * float64(absIntV2(int(tb>>8)-int(bb>>8)))
+			}
+		}
+	}
+	return rgbScore, textScore
+}
+
+// sampleColorMappedV2 returns the original-image colour at the destination
+// pixel (dstX,dstY) within dstRect, looked up through srcRect (i.e. the tile
+// that `mapping` places at this destination). Avoids rendering a full
+// candidate image per permutation.
+func sampleColorMappedV2(img image.Image, dstRect image.Rectangle, srcRect image.Rectangle, dstX int, dstY int) color.Color {
+	dx := dstRect.Dx()
+	if dx < 1 {
+		dx = 1
+	}
+	dy := dstRect.Dy()
+	if dy < 1 {
+		dy = 1
+	}
+	sx := srcRect.Min.X + (dstX-dstRect.Min.X)*srcRect.Dx()/dx
+	sy := srcRect.Min.Y + (dstY-dstRect.Min.Y)*srcRect.Dy()/dy
+	return img.At(sx, sy)
+}
+
+func sampleLumaMappedV2(img image.Image, dstRect image.Rectangle, srcRect image.Rectangle, dstX int, dstY int) uint8 {
+	c := sampleColorMappedV2(img, dstRect, srcRect, dstX, dstY)
+	r, g, b, _ := c.RGBA()
+	y := (299*(r>>8) + 587*(g>>8) + 114*(b>>8)) / 1000
+	return uint8(y)
+}
+
+// pixelDiff is the 8-bit absolute RGB difference of two colours (amurcanov v2
+// scale). Used by the seam scorers.
 func pixelDiff(a, b color.Color) int64 {
 	ar, ag, ab, _ := a.RGBA()
 	br, bg, bb, _ := b.RGBA()
-	return absDiff(ar, br) + absDiff(ag, bg) + absDiff(ab, bb)
-}
-
-func absDiff(a, b uint32) int64 {
-	if a > b {
-		return int64(a - b)
+	dr := int64(ar>>8) - int64(br>>8)
+	dg := int64(ag>>8) - int64(bg>>8)
+	db := int64(ab>>8) - int64(bb>>8)
+	if dr < 0 {
+		dr = -dr
 	}
-	return int64(b - a)
+	if dg < 0 {
+		dg = -dg
+	}
+	if db < 0 {
+		db = -db
+	}
+	return dr + dg + db
 }
 
+func absFloatV2(v float64) float64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func absIntV2(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// generateSliderCursor builds a human-like Bézier drag path, ported from
+// amurcanov buildSliderCursorV2 (start jitter → curved transit → approach →
+// settle, with per-point randomisation). Replaces our old 12-point straight
+// line. Returns a JSON array of {x,y} points. Coordinates are amurcanov's
+// empirical slider-widget pixels — proven to be accepted by VK; if a future
+// slider-mode test shows cursor-plausibility rejections we can rescale.
 func generateSliderCursor(candidateIndex, candidateCount int) string {
 	if candidateCount <= 0 {
 		return "[]"
 	}
-	type point struct {
-		X int   `json:"x"`
-		Y int   `json:"y"`
-		T int64 `json:"t"`
+	if candidateIndex < 1 {
+		candidateIndex = 1
 	}
-	startX := 140
-	endX := startX + 620*candidateIndex/candidateCount
-	startY := 430
-	startTime := time.Now().Add(-220 * time.Millisecond).UnixMilli()
+	if candidateIndex > candidateCount {
+		candidateIndex = candidateCount
+	}
 
-	points := make([]point, 12)
-	for i := 0; i < 12; i++ {
-		points[i] = point{
-			X: startX + (endX-startX)*i/11,
-			Y: startY + (i%3 - 1),
-			T: startTime + int64(i*18),
-		}
+	type cursorPoint struct {
+		X int `json:"x"`
+		Y int `json:"y"`
 	}
-	data, _ := json.Marshal(points)
+
+	startX := 570 + mathrand.Intn(40)
+	startY := 875 + mathrand.Intn(30)
+
+	denom := candidateCount - 1
+	if denom < 1 {
+		denom = 1
+	}
+	baseTargetX := 734 + (937-734)*(candidateIndex-1)/denom
+	targetX := baseTargetX + mathrand.Intn(10) - 5
+	targetY := 655 + mathrand.Intn(14)
+
+	points := make([]cursorPoint, 0, 28)
+
+	for i := 0; i < 1+mathrand.Intn(3); i++ {
+		points = append(points, cursorPoint{
+			X: startX + mathrand.Intn(5) - 2,
+			Y: startY + mathrand.Intn(5) - 2,
+		})
+	}
+
+	transitSteps := 2 + mathrand.Intn(3)
+	arcOffX := mathrand.Intn(60) - 30
+	arcOffY := -(mathrand.Intn(30) + 10)
+	for i := 1; i <= transitSteps; i++ {
+		t := float64(i) / float64(transitSteps+1)
+		cx := float64(startX+targetX)/2 + float64(arcOffX)
+		cy := float64(startY+targetY)/2 + float64(arcOffY)
+		bx := (1-t)*(1-t)*float64(startX) + 2*t*(1-t)*cx + t*t*float64(targetX)
+		by := (1-t)*(1-t)*float64(startY) + 2*t*(1-t)*cy + t*t*float64(targetY)
+		jitter := int((1-t)*8) + 2
+		points = append(points, cursorPoint{
+			X: int(math.Round(bx)) + mathrand.Intn(jitter*2+1) - jitter,
+			Y: int(math.Round(by)) + mathrand.Intn(jitter*2+1) - jitter,
+		})
+	}
+
+	approachSteps := 4 + mathrand.Intn(4)
+	prev := points[len(points)-1]
+	for i := 1; i <= approachSteps; i++ {
+		t := float64(i) / float64(approachSteps)
+		ax := prev.X + int(math.Round(t*float64(targetX-prev.X))) + mathrand.Intn(5) - 2
+		ay := prev.Y + int(math.Round(t*float64(targetY-prev.Y))) + mathrand.Intn(5) - 2
+		points = append(points, cursorPoint{X: ax, Y: ay})
+	}
+
+	settleCount := 3 + mathrand.Intn(5)
+	for i := 0; i < settleCount; i++ {
+		points = append(points, cursorPoint{
+			X: targetX + mathrand.Intn(7) - 3,
+			Y: targetY + mathrand.Intn(7) - 3,
+		})
+	}
+
+	data, err := json.Marshal(points)
+	if err != nil {
+		return "[]"
+	}
 	return string(data)
 }
