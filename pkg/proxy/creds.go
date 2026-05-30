@@ -1722,6 +1722,47 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		return e.addr, e.creds, slot, nil
 	}
 
+	// Phase 2 cold-start cap: don't let a COLD pool get over-fetched. When the
+	// pool starts empty (fresh install, or after a Settings "reset creds") and
+	// all NumConns race into get() at once with zero creds, only the first
+	// ~ceil(NumConns/connsPerSlot) conns should fetch a cred; the rest must PARK
+	// and SHARE those once they land (woken via slotAvailableCh /
+	// broadcastSlotAvailable), instead of each grabbing its own empty reserve
+	// slot. Without this cap every racing conn fetches into a distinct empty
+	// slot → the whole pool is over-provisioned → many creds get allocated at a
+	// burst rate → VK 486 "Allocation Quota Reached" → a self-perpetuating
+	// saturation cascade that leaves the surplus conns permanently unable to
+	// connect (observed 2026-05-30/31 after a reset-creds + forced-legacy test:
+	// 30 conns cold-started empty → over-fetched 12 slots → stuck 20/20).
+	//
+	// "provisioned" = creds we already hold (usable, any saturation state) +
+	// creds in flight (fetching). coldStartTarget ≈ ceil(NumConns/connsPerSlot),
+	// recovered from the pool size (size = ceil(NumConns*4/10) ⇒ ceil(size/4)).
+	// When provisioned already covers the target we have/will-have enough creds
+	// to host every conn at quota, so a conn that found no usable slot in
+	// Phase 1 parks: a slot opens up (a fetch completes, or a saturated slot's
+	// cooldown expires → broadcastSlotAvailable) and the conn shares it via the
+	// normal Phase-1 acquire on retry. This aligns conn-driven fetches with the
+	// grower's existing cold-start target (growCredPool) — the grower still
+	// fills reserve slots beyond the target, but slowly + staggered.
+	{
+		usable := cp.countWithUsableCredsLocked()
+		inFlight := 0
+		for i := range cp.pool {
+			if cp.pool[i].fetching {
+				inFlight++
+			}
+		}
+		coldStartTarget := (cp.size + 3) / 4 // ceil(size/4) ≈ ceil(NumConns/connsPerSlot)
+		if coldStartTarget < 1 {
+			coldStartTarget = 1
+		}
+		if usable+inFlight >= coldStartTarget {
+			cp.mu.Unlock()
+			return "", nil, -1, fmt.Errorf("credpool: cold-start cap (%d usable+inflight >= %d target) — parking to share instead of over-fetching", usable+inFlight, coldStartTarget)
+		}
+	}
+
 	// Phase 2: no usable fresh slot. Pick a fetch target — first
 	// candidate that's not fresh AND not pending AND not on cooldown
 	// AND not already being fetched. Prefer ownSlot here too. Skipping
