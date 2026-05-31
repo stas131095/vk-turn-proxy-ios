@@ -6,6 +6,8 @@ build_output/
 /WireGuardBridge/WireGuardBridge
 /turn_bw_test
 /turn_bw_server
+/tools/turn_srtp_server/turn_srtp_server
+/tools/turn_srtp_test/turn_srtp_test
 
 # Xcode
 *.xcuserdata
