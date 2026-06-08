@@ -60,15 +60,34 @@ struct ContentView: View {
     @AppStorage("numConnections") private var numConnections = 30
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
-    /// SRTP-WRAP-A requires a non-empty password (it derives the obfuscation
-    /// key AND authenticates GETCONF). An empty password makes the Go side
-    /// disable WRAP-A and silently fall through to the broken direct transport,
-    /// so we block Connect here with a clear message. nil = OK to connect.
-    private var wrapAValidationError: String? {
-        if useWrapA && wrapAPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return "SRTP-WRAP-A requires a server password — set it in Settings."
+    /// First BLOCKING (.error) validation issue for the ACTIVE server mode, or
+    /// nil if the config is good enough to attempt a connection. Gates the
+    /// Connect button — a malformed required field would otherwise just fail
+    /// the handshake silently. Mode-aware: WRAP-A validates the password (WG
+    /// keys are server-provisioned via GETCONF); the other modes validate the
+    /// WG keys instead. Format / optional-field issues are surfaced as
+    /// non-blocking hints in Settings, not here. Mirrors serverModeBinding's
+    /// precedence (useWrapA > useSrtp > useWrap).
+    private var configValidationError: String? {
+        var issues: [ConfigValidation.Issue?] = [
+            ConfigValidation.vkLink(vkLink),
+            ConfigValidation.peerAddress(peerAddress),
+            ConfigValidation.turnOverride(turnServerOverride),
+        ]
+        if useWrapA {
+            issues.append(ConfigValidation.wrapAPassword(wrapAPassword))
+        } else {
+            issues.append(ConfigValidation.wgKey(privateKey, label: "Private key", required: true))
+            issues.append(ConfigValidation.wgKey(peerPublicKey, label: "Peer public key", required: true))
+            issues.append(ConfigValidation.wgKey(presharedKey, label: "Preshared key", required: false))
+            issues.append(ConfigValidation.tunnelAddress(tunnelAddress))
+            // SRTP+WRAP (mode precedence: not WRAP-A, not SRTP, WRAP on) also
+            // needs the hex key.
+            if !useSrtp && useWrap {
+                issues.append(ConfigValidation.wrapKeyHex(wrapKeyHex))
+            }
         }
-        return nil
+        return issues.compactMap { $0 }.first { $0.severity == .error }?.message
     }
 
     /// Parse the optional "TURN server" override ("IP:port") into (host, port),
@@ -113,10 +132,12 @@ struct ContentView: View {
                             .padding(.horizontal)
                     }
 
-                    // SRTP-WRAP-A password validation — shown only while
-                    // disconnected (it gates the Connect button below).
+                    // Blocking config-validation error for the active server
+                    // mode — shown only while disconnected (it gates the
+                    // Connect button below). Required-field errors only;
+                    // non-blocking format hints live inline in Settings.
                     if tunnel.status != .connected, tunnel.status != .connecting,
-                       let v = wrapAValidationError {
+                       let v = configValidationError {
                         Text(v)
                             .font(.caption)
                             .foregroundColor(.orange)
@@ -185,10 +206,11 @@ struct ContentView: View {
                     }
                     .padding(.horizontal)
                     .padding(.top, 8)
-                    // Block Connect in SRTP-WRAP-A mode without a password
-                    // (empty password → Go disables WRAP-A → broken direct
-                    // fallback). Never disables the Disconnect action.
-                    .disabled(tunnel.status != .connected && tunnel.status != .connecting && wrapAValidationError != nil)
+                    // Block Connect when a required field for the active mode
+                    // is empty/invalid (e.g. WRAP-A without a password → Go
+                    // disables WRAP-A → broken direct fallback; or a malformed
+                    // peerAddress / WG key). Never disables the Disconnect action.
+                    .disabled(tunnel.status != .connected && tunnel.status != .connecting && configValidationError != nil)
 
                     // Logs & Settings links
                     HStack(spacing: 24) {
@@ -434,6 +456,19 @@ struct SettingsView: View {
         )
     }
 
+    /// Inline validation caption shown under a field. Red for blocking
+    /// (.error) issues, orange for non-blocking (.warning) ones; renders
+    /// nothing when the field is OK. Uses the shared ConfigValidation so the
+    /// inline hint and the Connect-gate in ContentView always agree.
+    @ViewBuilder
+    private func hint(_ issue: ConfigValidation.Issue?) -> some View {
+        if let issue {
+            Text(issue.message)
+                .font(.caption)
+                .foregroundColor(issue.severity == .error ? .red : .orange)
+        }
+    }
+
     var body: some View {
         Form {
             Section("VK TURN Proxy") {
@@ -441,10 +476,12 @@ struct SettingsView: View {
                     .textContentType(.URL)
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
+                hint(ConfigValidation.vkLink(vkLink))
 
                 TextField("Proxy Server (host:port)", text: $peerAddress)
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
+                hint(ConfigValidation.peerAddress(peerAddress))
 
                 // Optional TURN-relay override. When set to IP:port, the app
                 // ignores VK's TURN address and forces fresh conns onto this
@@ -454,6 +491,7 @@ struct SettingsView: View {
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
                     .keyboardType(.numbersAndPunctuation)
+                hint(ConfigValidation.turnOverride(turnServerOverride))
 
                 // "DTLS Obfuscation" toggle removed from UI 2026-05-22
                 // (build 127). The toggle was misleading: on the SRTP
@@ -514,6 +552,7 @@ struct SettingsView: View {
                     SecureField("WRAP key (64 hex chars)", text: $wrapKeyHex)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
+                    hint(ConfigValidation.wrapKeyHex(wrapKeyHex))
                 }
 
                 // SRTP-WRAP-A (amurcanov interop): the server provisions
@@ -525,11 +564,7 @@ struct SettingsView: View {
                     SecureField("Server password", text: $wrapAPassword)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
-                    if wrapAPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text("Required — derives the obfuscation key and authenticates GETCONF.")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                    }
+                    hint(ConfigValidation.wrapAPassword(wrapAPassword))
                 }
 
                 // TURN control transport: UDP (true) vs TCP (false /
@@ -566,23 +601,29 @@ struct SettingsView: View {
                 SecureField("Private Key (base64)", text: $privateKey)
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
+                hint(ConfigValidation.wgKey(privateKey, label: "Private key", required: true))
 
                 TextField("Peer Public Key (base64)", text: $peerPublicKey)
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
+                hint(ConfigValidation.wgKey(peerPublicKey, label: "Peer public key", required: true))
 
                 SecureField("Preshared Key (base64)", text: $presharedKey)
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
+                hint(ConfigValidation.wgKey(presharedKey, label: "Preshared key", required: false))
 
                 TextField("Tunnel Address", text: $tunnelAddress)
                     .autocapitalization(.none)
+                hint(ConfigValidation.tunnelAddress(tunnelAddress))
 
                 TextField("DNS Servers", text: $dnsServers)
                     .autocapitalization(.none)
+                hint(ConfigValidation.dnsServers(dnsServers))
 
                 TextField("Allowed IPs", text: $allowedIPs)
                     .autocapitalization(.none)
+                hint(ConfigValidation.allowedIPs(allowedIPs))
             }
             } // end `if != .srtpWrapA` — WireGuard section hidden in WRAP-A mode
 

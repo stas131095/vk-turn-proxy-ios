@@ -11,6 +11,7 @@
 		118478458E595AEBEEA20266 /* TunnelManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E74B178DC212A229BC8565F4 /* TunnelManager.swift */; };
 		1B2231DF1954F65A65A76DF6 /* WireGuardTURN.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 99E2AC40D13D6F8DD598752A /* WireGuardTURN.xcframework */; };
 		2263C90DC75E56A0D637B2B4 /* CredCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = B72BF34DDA41B9171843CDA5 /* CredCache.swift */; };
+		23FB3FA154A0B74AE5DFB39C /* ConfigValidation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0ACB6146869BD6DC55039EC2 /* ConfigValidation.swift */; };
 		3F33AE79B74735B536FE1D31 /* SharedLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = A648919F90B0D8CBE826BC6E /* SharedLogger.swift */; };
 		4FB5626AA1842BFC42564DBF /* PacketTunnel.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = E28ACD6367F3CDE026C71A36 /* PacketTunnel.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		5474956678AC676C6E7AE2E6 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 50685ED014984982ABF8CF0C /* Assets.xcassets */; };
@@ -53,6 +54,7 @@
 
 /* Begin PBXFileReference section */
 		00AF3235469FAE0005F97B29 /* BridgeHeader.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BridgeHeader.h; sourceTree = "<group>"; };
+		0ACB6146869BD6DC55039EC2 /* ConfigValidation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigValidation.swift; sourceTree = "<group>"; };
 		12A7A42ADDB7D021CA9C8352 /* VKTurnProxy.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = VKTurnProxy.entitlements; sourceTree = "<group>"; };
 		3979E0E80EBC90588B51D4A5 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		48CEB6CB28E1CC064B6D8C79 /* VKProfileCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VKProfileCache.swift; sourceTree = "<group>"; };
@@ -134,6 +136,7 @@
 				50685ED014984982ABF8CF0C /* Assets.xcassets */,
 				4D13B015BF30B930DDDB8BBF /* BackupManager.swift */,
 				00AF3235469FAE0005F97B29 /* BridgeHeader.h */,
+				0ACB6146869BD6DC55039EC2 /* ConfigValidation.swift */,
 				A3F6AB47B5515172AD460053 /* ContentView.swift */,
 				B72BF34DDA41B9171843CDA5 /* CredCache.swift */,
 				3979E0E80EBC90588B51D4A5 /* Info.plist */,
@@ -265,6 +268,7 @@
 			files = (
 				CBF9B6203060C546C778DABA /* AppConfig.swift in Sources */,
 				FD1864DD0B5915A3945CE086 /* BackupManager.swift in Sources */,
+				23FB3FA154A0B74AE5DFB39C /* ConfigValidation.swift in Sources */,
 				96F82C428BBBE30E65182344 /* ContentView.swift in Sources */,
 				2263C90DC75E56A0D637B2B4 /* CredCache.swift in Sources */,
 				9FC59D2A14AA5E66C86F6C95 /* OSLogReader.swift in Sources */,
@@ -290,7 +294,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
-				CURRENT_PROJECT_VERSION = 157;
+				CURRENT_PROJECT_VERSION = 158;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -320,7 +324,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = VKTurnProxy/VKTurnProxy.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				CURRENT_PROJECT_VERSION = 157;
+				CURRENT_PROJECT_VERSION = 158;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -346,7 +350,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
-				CURRENT_PROJECT_VERSION = 157;
+				CURRENT_PROJECT_VERSION = 158;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -441,7 +445,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = VKTurnProxy/VKTurnProxy.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				CURRENT_PROJECT_VERSION = 157;
+				CURRENT_PROJECT_VERSION = 158;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
