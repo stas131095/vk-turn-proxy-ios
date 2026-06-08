@@ -479,18 +479,16 @@ func NewProxy(cfg Config) *Proxy {
 	// captcha flow). The first conn's get() returns these without an API
 	// call, dodging the .connecting-window captcha deadlock.
 	if cfg.SeededTURN != nil {
-		// Build TURN host:port the same way fetchFreshCreds would,
-		// honoring TurnServer/TurnPort overrides if set.
-		turnHost, turnPort, err := net.SplitHostPort(cfg.SeededTURN.Address)
+		// The seed comes from the main app's pre-bootstrap — either a
+		// disk-cached cred or a fresh probe. Its address is used VERBATIM: the
+		// TurnServer/TurnPort override does NOT apply here. The override only
+		// rewrites fresh VK fetches in fetchFreshCreds; a disk-cached seed
+		// keeps its stored address (the "setting must not affect cached creds"
+		// guarantee), and a fresh probe-seed is already overridden Swift-side
+		// before it reaches here.
+		turnHost, _, err := net.SplitHostPort(cfg.SeededTURN.Address)
 		if err == nil {
-			if cfg.TurnServer != "" {
-				turnHost = cfg.TurnServer
-			}
-			if cfg.TurnPort != "" {
-				turnPort = cfg.TurnPort
-			}
-			addr := net.JoinHostPort(turnHost, turnPort)
-			p.credPool.seedSlot(0, addr, cfg.SeededTURN)
+			p.credPool.seedSlot(0, cfg.SeededTURN.Address, cfg.SeededTURN)
 			p.turnServerIP.Store(turnHost)
 		} else {
 			log.Printf("NewProxy: SeededTURN address %q is not host:port (%v) — ignoring", cfg.SeededTURN.Address, err)
@@ -2004,13 +2002,15 @@ func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool) (string, *TURNCreds, err
 	if err != nil {
 		return "", nil, fmt.Errorf("get VK creds: %w", err)
 	}
-	// Apply TurnServer/TurnPort overrides (test/dev only — empty in
-	// production) to every VK-returned address. Today we use only
-	// Addresses[0] (see resolveTURNAddr — no per-conn rotation under
-	// includeAllNetworks=true single-exempt-host limitation), but
-	// keeping all entries uniformly overridden means a future failover
-	// or rotation experiment doesn't have to redo the override pass.
-	// Addresses must be non-empty (getVKCredsWithClientID guarantees ≥1).
+	// Apply the "TURN server" override (Settings → optional turn_server/
+	// turn_port; empty = no override) to every VK-returned address. This is
+	// the fresh-fetch path: the override affects creds RECEIVED FROM VK and
+	// bakes into the cred + on-disk cache (intended). Cached/seeded creds are
+	// used as STORED — the seed path in NewProxy does NOT re-apply the
+	// override (the "setting must not affect cached creds" guarantee). Today
+	// only Addresses[0] is dialed (resolveTURNAddr), but we override all
+	// entries uniformly so a future failover doesn't redo the pass. Addresses
+	// must be non-empty (getVKCredsWithClientID guarantees ≥1).
 	for i, vkAddr := range creds.Addresses {
 		h, pport, perr := net.SplitHostPort(vkAddr)
 		if perr != nil {

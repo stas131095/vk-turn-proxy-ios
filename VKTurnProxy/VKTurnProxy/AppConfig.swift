@@ -108,6 +108,10 @@ struct AppSettings: Codable {
     /// WRAP-A shared secret (obfuscation key + GETCONF auth). Optional for
     /// back-compat. Plaintext like the WG private key above.
     let wrapAPassword: String?
+    /// turnServerOverride: optional "IP:port" (added 2026-06-08). When set,
+    /// fresh VK fetches are forced onto this TURN relay; disk-cached creds keep
+    /// their stored address. Optional for back-compat; nil = no override.
+    let turnServerOverride: String?
     /// UNDOCUMENTED on-device captcha-test toggle (build 149): when true the
     /// extension skips the captcha-free VK Calls path so the legacy
     /// captchaNotRobot.* solver runs — lets a tester exercise the captcha fix
@@ -207,6 +211,9 @@ struct ConnectionSettings: Codable {
     /// Optional for back-compat; nil keeps the device's current value.
     let useWrapA: Bool?
     let wrapAPassword: String?
+    /// turnServerOverride: optional "IP:port" TURN-relay override (added
+    /// 2026-06-08). nil keeps the device's current value.
+    let turnServerOverride: String?
     /// Optional: if absent, the importing device keeps its current
     /// dnsServers value (or the AppStorage default of "1.1.1.1" if
     /// never set). Always set on apply when present.

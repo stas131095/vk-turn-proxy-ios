@@ -109,7 +109,8 @@ enum BackupManager {
             // password so a full backup round-trips it. deviceID is NOT
             // exported (per-install identity).
             useWrapA: (d.object(forKey: "useWrapA") as? Bool) ?? false,
-            wrapAPassword: d.string(forKey: "wrapAPassword") ?? ""
+            wrapAPassword: d.string(forKey: "wrapAPassword") ?? "",
+            turnServerOverride: d.string(forKey: "turnServerOverride")
         )
 
         var turnPool: CredCacheFile? = nil
@@ -241,6 +242,7 @@ enum BackupManager {
         // WRAP-A (amurcanov interop): same nil-preserves-default pattern.
         if let v = s.useWrapA { d.set(v, forKey: "useWrapA") }
         if let v = s.wrapAPassword { d.set(v, forKey: "wrapAPassword") }
+        if let v = s.turnServerOverride { d.set(v, forKey: "turnServerOverride") }
         // forceLegacyCaptcha: undocumented on-device captcha-test toggle
         // (build 149) — same nil-preserves-default pattern.
         if let v = s.forceLegacyCaptcha { d.set(v, forKey: "forceLegacyCaptcha") }
@@ -447,6 +449,7 @@ enum BackupManager {
         // preserves-default like the toggles above.
         if let v = s.useWrapA { d.set(v, forKey: "useWrapA") }
         if let v = s.wrapAPassword { d.set(v, forKey: "wrapAPassword") }
+        if let v = s.turnServerOverride { d.set(v, forKey: "turnServerOverride") }
         if let v = s.dnsServers { d.set(v, forKey: "dnsServers") }
         if let v = s.numConnections { d.set(v, forKey: "numConnections") }
         // Truncate vkLink and peerAddress in the log so we don't dump

@@ -84,6 +84,10 @@ the importer's current value with empty):
                        its current value (default false).
     wrapAPassword    — string. The amurcanov shared secret (obfuscation key +
                        GETCONF auth). Required when useWrapA=True.
+    turnServerOverride — optional "IP:port" (added 2026-06-08). Forces fresh
+                       conns onto this TURN relay instead of VK's returned
+                       address; disk-cached creds keep their stored address.
+                       Omit / leave empty to use whatever VK returns.
 
 Compat note: links generated against iOS build 128 or earlier MUST include
 useDTLS, useWrap, and wrapKeyHex (iOS Codable rejects the link otherwise).
@@ -154,6 +158,11 @@ CONFIG = {
     # peerAddress + wrapAPassword are required in this mode.
     # "useWrapA":       True,
     # "wrapAPassword":  "REPLACE_ME",
+    # ----- TURN server override (optional) -----
+    # Force fresh conns onto a specific TURN relay instead of whatever VK
+    # returns (disk-cached creds keep their stored address). Uncomment + set
+    # to IP:port. Omitted / empty = use VK's relays.
+    # "turnServerOverride": "1.2.3.4:19302",
 }
 
 REQUIRED = (

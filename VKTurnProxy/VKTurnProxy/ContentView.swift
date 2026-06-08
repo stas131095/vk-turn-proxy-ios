@@ -19,6 +19,11 @@ struct ContentView: View {
     @AppStorage("allowedIPs") private var allowedIPs = "0.0.0.0/0"
     @AppStorage("vkLink") private var vkLink = ""
     @AppStorage("peerAddress") private var peerAddress = ""
+    // turnServerOverride: optional "IP:port". When non-empty + valid, the app
+    // ignores the TURN IP:port VK returns and forces FRESH conns onto this
+    // relay instead. Disk-cached creds keep their stored address (this setting
+    // does not affect their use). Empty = use whatever VK returns.
+    @AppStorage("turnServerOverride") private var turnServerOverride = ""
     @AppStorage("useDTLS") private var useDTLS = true
     // useWrap / wrapKeyHex are the persisted form of the SRTP+WRAP
     // server-mode selection. Surfaced in Settings as a third Picker
@@ -64,6 +69,20 @@ struct ContentView: View {
             return "SRTP-WRAP-A requires a server password — set it in Settings."
         }
         return nil
+    }
+
+    /// Parse the optional "TURN server" override ("IP:port") into (host, port),
+    /// or nil if empty/malformed (treated as no override). Splits on the LAST
+    /// colon so IPv4:port parses cleanly; the port must be all digits.
+    private func parseTurnOverride(_ s: String) -> (host: String, port: String)? {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, let colon = t.lastIndex(of: ":") else { return nil }
+        let host = String(t[..<colon])
+        let port = String(t[t.index(after: colon)...])
+        guard !host.isEmpty, !port.isEmpty, port.allSatisfy(\.isNumber), Int(port) != nil else {
+            return nil
+        }
+        return (host, port)
     }
 
     var body: some View {
@@ -128,6 +147,7 @@ struct ContentView: View {
                         } else {
                             NSLog("[UI] user pressed Connect button (status=\(tunnel.status.rawValue))")
                             SharedLogger.shared.log("[UI] user pressed Connect button (status=\(tunnel.status.rawValue))")
+                            let turnOv = parseTurnOverride(turnServerOverride)
                             let config = TunnelConfig(
                                 privateKey: privateKey,
                                 peerPublicKey: peerPublicKey,
@@ -146,7 +166,9 @@ struct ContentView: View {
                                 useUDP: useUDP,
                                 forceLegacyCaptcha: UserDefaults.standard.bool(forKey: "forceLegacyCaptcha"),
                                 numConnections: numConnections,
-                                credPoolCooldownSeconds: credPoolCooldownSeconds
+                                credPoolCooldownSeconds: credPoolCooldownSeconds,
+                                turnServerOverride: turnOv?.host,
+                                turnPortOverride: turnOv?.port
                             )
                             Task {
                                 await tunnel.connect(config: config)
@@ -306,6 +328,11 @@ struct SettingsView: View {
     @AppStorage("allowedIPs") private var allowedIPs = "0.0.0.0/0"
     @AppStorage("vkLink") private var vkLink = ""
     @AppStorage("peerAddress") private var peerAddress = ""
+    // turnServerOverride: optional "IP:port". When non-empty + valid, the app
+    // ignores the TURN IP:port VK returns and forces FRESH conns onto this
+    // relay instead. Disk-cached creds keep their stored address (this setting
+    // does not affect their use). Empty = use whatever VK returns.
+    @AppStorage("turnServerOverride") private var turnServerOverride = ""
     @AppStorage("useDTLS") private var useDTLS = true
     // useWrap / wrapKeyHex are the persisted form of the SRTP+WRAP
     // server-mode selection. Surfaced in Settings as a third Picker
@@ -418,6 +445,15 @@ struct SettingsView: View {
                 TextField("Proxy Server (host:port)", text: $peerAddress)
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
+
+                // Optional TURN-relay override. When set to IP:port, the app
+                // ignores VK's TURN address and forces fresh conns onto this
+                // relay (disk-cached creds keep their stored address). Empty =
+                // use whatever VK returns. Malformed input is ignored.
+                TextField("TURN server (IP:port, optional)", text: $turnServerOverride)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+                    .keyboardType(.numbersAndPunctuation)
 
                 // "DTLS Obfuscation" toggle removed from UI 2026-05-22
                 // (build 127). The toggle was misleading: on the SRTP

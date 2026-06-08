@@ -292,8 +292,19 @@ class TunnelManager: ObservableObject {
                 )
                 switch result {
                 case .ok(let addr, let user, let pass):
-                    seededTURN = (addr, user, pass)
-                    SharedLogger.shared.log("[AppDebug] pre-bootstrap: TURN creds acquired (addr=\(addr))")
+                    // A fresh probe is a VK "receive" → honor the TURN override
+                    // if set + valid. Cached seeds (above) are NOT overridden.
+                    // The cred is relay-agnostic across VK's set, so forcing a
+                    // different relay works.
+                    if let h = config.turnServerOverride, !h.isEmpty,
+                       let pt = config.turnPortOverride, !pt.isEmpty {
+                        let ov = "\(h):\(pt)"
+                        seededTURN = (ov, user, pass)
+                        SharedLogger.shared.log("[AppDebug] pre-bootstrap: TURN override active — using \(ov) for the probe seed (VK gave \(addr))")
+                    } else {
+                        seededTURN = (addr, user, pass)
+                        SharedLogger.shared.log("[AppDebug] pre-bootstrap: TURN creds acquired (addr=\(addr))")
+                    }
                     break probeLoop
                 case .captcha(let url, let sid, let ts, let captchaAttempt, let token1, let clientID, let isRateLimit):
                     if isRateLimit {
