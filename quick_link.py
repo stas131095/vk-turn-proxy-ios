@@ -27,9 +27,16 @@ missing or empty):
     privateKey       — WG client private key (base64)
     peerPublicKey    — WG server public key  (base64)
     tunnelAddress    — e.g. "192.168.102.3/24"
-    allowedIPs       — e.g. "0.0.0.0/0"
     vkLink           — https://vk.me/join/<token>
     peerAddress      — e.g. "1.2.3.4:51820" (the WG server, not the TURN)
+
+allowedIPs is NOT emitted (removed 2026-06-11). The iOS app pins the
+WireGuard peer allowed_ip to 0.0.0.0/0 — under includeAllNetworks=true that
+is the only correct value (a narrower one blackholes traffic, never splits),
+and the Settings field was removed in build 160. New links omit it and the
+importer keeps the device default 0.0.0.0/0. OLD links that still carry
+allowedIPs are still accepted + applied (ConnectionSettings.allowedIPs stays
+Optional on the iOS side).
 
 Optional fields (delete or comment out the CONFIG key to omit them from
 the link — leaving an empty string still gets sent through and overwrites
@@ -119,7 +126,6 @@ CONFIG = {
     "privateKey":     "REPLACE_ME",
     "peerPublicKey":  "REPLACE_ME",
     "tunnelAddress":  "192.168.102.3/24",
-    "allowedIPs":     "0.0.0.0/0",
     "vkLink":         "REPLACE_ME",         # https://vk.me/join/...
     "peerAddress":    "REPLACE_ME",         # ip:port of the WG server
 
@@ -172,7 +178,7 @@ CONFIG = {
 
 REQUIRED = (
     "privateKey", "peerPublicKey",
-    "tunnelAddress", "allowedIPs",
+    "tunnelAddress",
     "vkLink", "peerAddress",
 )
 
