@@ -8,7 +8,7 @@ fingerprint, and applies the settings on confirm. The same payload also
 works pasted bare on the iPhone clipboard (Settings → Backup & Restore →
 "Import from Connection Link").
 
-Two ways to feed it:
+Three ways to feed it:
 
     1. Edit the CONFIG dict below in-place with your deployment values
        and run with no args:
@@ -20,6 +20,21 @@ Two ways to feed it:
        password manager:
 
            python3 quick_link.py my-deployment.json
+
+    3. Provision a NEW client: generate a fresh WireGuard keypair, override
+       CONFIG["privateKey"] with it, and print BOTH the link (carrying the new
+       private key) AND the matching server-side [Peer] block (new public key,
+       AllowedIPs = <tunnelAddress IP>/32, + PresharedKey if set in CONFIG):
+
+           python3 quick_link.py -gen-peer-key
+
+       An optional second arg "ip/mask" overrides CONFIG["tunnelAddress"]
+       (use a distinct tunnel IP per client):
+
+           python3 quick_link.py -gen-peer-key 192.168.102.11/24
+
+       peerPublicKey / vkLink / peerAddress still come from CONFIG — the server
+       side is fixed; only the client keypair + tunnel IP vary per client.
 
 Required fields (the link is rejected by the iOS parser if any are
 missing or empty):
@@ -118,6 +133,7 @@ Export/Import flow in the app instead.
 
 import base64
 import json
+import os
 import sys
 
 # Edit these to your deployment values, then run the script.
@@ -257,8 +273,81 @@ def build_link(settings):
     return f"vkturnproxy://import?data={b64}"
 
 
+# ─── WireGuard keypair generation (for the -gen-peer-key mode) ──────────────
+# Pure-Python X25519 (RFC 7748) so the script stays dependency-free. Produces
+# the same base64 keys as `wg genkey` / `wg pubkey`.
+
+def _x25519(k_int, u_int):
+    P = 2 ** 255 - 19
+    x1 = u_int
+    x2, z2, x3, z3, swap = 1, 0, u_int, 1, 0
+    for t in reversed(range(255)):
+        kt = (k_int >> t) & 1
+        swap ^= kt
+        if swap:
+            x2, x3 = x3, x2
+            z2, z3 = z3, z2
+        swap = kt
+        A = (x2 + z2) % P
+        AA = A * A % P
+        B = (x2 - z2) % P
+        BB = B * B % P
+        E = (AA - BB) % P
+        C = (x3 + z3) % P
+        D = (x3 - z3) % P
+        DA = D * A % P
+        CB = C * B % P
+        x3 = (DA + CB) ** 2 % P
+        z3 = x1 * (DA - CB) ** 2 % P
+        x2 = AA * BB % P
+        z2 = E * (AA + 121665 * E) % P
+    if swap:
+        x2, x3 = x3, x2
+        z2, z3 = z3, z2
+    return x2 * pow(z2, P - 2, P) % P
+
+
+def gen_wg_keypair():
+    """Return (privateKey_b64, publicKey_b64) — a fresh WireGuard X25519 pair,
+    base64-encoded exactly like `wg genkey` / `wg pubkey`."""
+    priv = bytearray(os.urandom(32))
+    priv[0] &= 248
+    priv[31] &= 127
+    priv[31] |= 64
+    pub = _x25519(int.from_bytes(priv, "little"), 9).to_bytes(32, "little")
+    return base64.b64encode(bytes(priv)).decode(), base64.b64encode(pub).decode()
+
+
+def peer_section(settings, public_key_b64):
+    """The server-side [Peer] block matching the freshly-generated client key:
+    AllowedIPs = <tunnelAddress IP>/32, PublicKey = <generated pub>, plus a
+    PresharedKey line if one is set in CONFIG."""
+    ip = settings.get("tunnelAddress", "").split("/")[0].strip()
+    lines = ["[Peer]", f"AllowedIPs = {ip}/32", f"PublicKey = {public_key_b64}"]
+    psk = settings.get("presharedKey", "")
+    if psk and psk != "REPLACE_ME":
+        lines.append(f"PresharedKey = {psk}")
+    return "\n".join(lines)
+
+
 def main():
-    settings = load_config(sys.argv)
+    argv = sys.argv
+    # -gen-peer-key: generate a fresh WireGuard client keypair, override
+    # CONFIG["privateKey"] with it (even if already filled), optionally override
+    # tunnelAddress from a second "ip/mask" arg, then emit the link AND the
+    # matching server-side [Peer] block (with the generated public key).
+    if len(argv) > 1 and argv[1] == "-gen-peer-key":
+        settings = dict(CONFIG)
+        priv_b64, pub_b64 = gen_wg_keypair()
+        settings["privateKey"] = priv_b64
+        if len(argv) > 2:
+            settings["tunnelAddress"] = argv[2]
+        validate(settings)
+        print(build_link(settings))
+        print()
+        print(peer_section(settings, pub_b64))
+        return
+    settings = load_config(argv)
     validate(settings)
     print(build_link(settings))
 
