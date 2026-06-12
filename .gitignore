@@ -39,6 +39,7 @@ AppStoreConnect.env
 .private-notes/
 
 # local scripts
+release.sh
 install.sh
 idev.sh
 iphone.tcpdump.sh
