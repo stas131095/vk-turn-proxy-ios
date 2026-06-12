@@ -66,7 +66,7 @@ https://github.com/samosvalishe/vk-turn-proxy/releases
 В разделе "VK TURN Proxy" необходимо ввести следующие настройки:
 
 - URL VK звонка (https://vk.ru/call/join/xxxxxxxxxxxxxxxxxxxxxx)
-- IP адрес и порт сервера, где запущена серверная часть vk-turn-proxy (то, что настроено в параметре -listen XXX.XXX.XXX.XXX:56000 на сервере)
+- IP адрес и порт сервера, где запущена серверная часть vk-turn-proxy (то, что настроено в параметре ```-listen XXX.XXX.XXX.XXX:56000``` на сервере)
 - опционально адрес и порт непосредственно TURN relay (в общем случае оставляем пустым)
 - выбрать режим подключения (server mode)
 - опционально включить UDP в качестве транспорта (может быть несколько быстрее, чем TCP по умолчанию, но TCP значительно устойчивее)
@@ -85,7 +85,6 @@ https://github.com/samosvalishe/vk-turn-proxy/releases
 
 - IP адрес и маску (должны соответствовать AllowedIPs в одном из разделов [Peer] на стороне WireGuard сервера)
 - IP адрес DNS сервера, который будет использоваться поверх туннеля
-- IP сеть и маску для отправки в туннель (в общем случае должно быть 0.0.0.0/0, так как для этого приложения iOS выбран режим includeAllNetworks=true)
 
 <img width="750" height="415" alt="image" src="https://github.com/user-attachments/assets/51e1a4ab-89f7-4633-bbce-dae4684cc952" />
 
