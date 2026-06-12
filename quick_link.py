@@ -165,11 +165,15 @@ CONFIG = {
     "useDTLS":        True,                 # default; legacy DTLS+WG fallback
     "useWrap":        False,                # WRAP largely defunct since 2026-05-18
     "wrapKeyHex":     "",                   # 64 hex chars, only if useWrap=True
-    # useSrtp / useUDP: see docstring at top for semantics. Both default
-    # false (safe for users on the legacy DTLS+WG path). Set useSrtp=true
-    # only if the peerAddress points at a -srtp-enabled server. Set
-    # useUDP=true only if your network requires UDP-control transport.
-    "useSrtp":        False,
+    # useSrtp defaults True — SRTP is the app's production transport (the
+    # server must run with -srtp). After the build-159 fix the mode triple is
+    # applied authoritatively on import, so a plain link with useSrtp/useWrap/
+    # useWrapA all false would land the device in LEGACY mode; defaulting
+    # useSrtp=True keeps a default link on the SRTP path. Set useSrtp=false only
+    # for a legacy DTLS+WG server. (useUDP below stays false — TCP-control
+    # bypasses VK's per-cred allocation-rate throttle; set true only if your
+    # network needs UDP-control transport.)
+    "useSrtp":        True,
     "useUDP":         False,
     # useWrapA is emitted EXPLICITLY (not omitted) so the link fully defines the
     # server mode. Omitting it caused an import bug (2026-06-10): a non-WRAP-A
