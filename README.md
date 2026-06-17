@@ -6,7 +6,7 @@
 
 ## Установка
 
-[TestFlight](https://testflight.apple.com/join/ANm6cmDv) или самостоятельная загрузка IPA файла из раздела [Releases](https://github.com/anton48/vk-turn-proxy-ios/releases) на устройство (потребуется подписать его с помощью того или иного сервиса.
+[TestFlight](https://testflight.apple.com/join/ANm6cmDv) или самостоятельная загрузка IPA файла из раздела [Releases](https://github.com/anton48/vk-turn-proxy-ios/releases) на устройство (потребуется подписать его с помощью того или иного сервиса).
 
 ## Документация
 
