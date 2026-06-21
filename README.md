@@ -10,7 +10,21 @@
 
 ## Документация
 
-[Настройка](https://github.com/anton48/vk-turn-proxy-ios/blob/main/docs/setup.md)
+[Как это работает](https://github.com/anton48/vk-turn-proxy-ios/blob/main/docs/setup.md#как-это-работает)
+
+[Что необходимо для работы](https://github.com/anton48/vk-turn-proxy-ios/blob/main/docs/setup.md#что-необходимо-для-работы)
+
+[Режимы работы](https://github.com/anton48/vk-turn-proxy-ios/blob/main/docs/setup.md#режимы-работы)
+
+[Настройки приложения](https://github.com/anton48/vk-turn-proxy-ios/blob/main/docs/setup.md#настройки-клиентского-приложения)
+
+[Автоматические ссылки](https://github.com/anton48/vk-turn-proxy-ios/blob/main/docs/setup.md#автоматические-ссылки)
+
+[Backup/Restore](https://github.com/anton48/vk-turn-proxy-ios/blob/main/docs/setup.md#backuprestore)
+
+[Капча](https://github.com/anton48/vk-turn-proxy-ios/blob/main/docs/setup.md#капча)
+
+[Ответы на частые вопросы, решение проблем](https://github.com/anton48/vk-turn-proxy-ios/blob/main/docs/setup.md#ответы-на-частые-вопросы-решение-проблем)
 
 ## Credits
 
