@@ -189,6 +189,25 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 	// On any failure (including unexpected captcha gate appearing on the new
 	// path), fall through to the legacy multi-client_id retry loop below.
 	if savedToken1 == "" && solvedCaptchaSID == "" && savedClientID == "" {
+		// Non-anonymous cookie (logged-in) path — tried FIRST when the user
+		// has enabled cookie auth in Settings and a remixsid is present. This
+		// is the fallback for when VK disables anonymous call join. On any
+		// failure (e.g. cookie expired) we fall through to the anonymous paths
+		// below, so connectivity still works whenever anon is available.
+		// See creds_vkcookie.go.
+		if cookieAuthEnabled.Load() {
+			if ch := vkCookieHeader(); ch != "" {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				creds, err := getVKCredsViaCookies(ctx, linkID, ch)
+				cancel()
+				if err == nil {
+					log.Printf("vk: success via cookie (logged-in) path")
+					return creds, nil
+				}
+				log.Printf("vk: cookie path failed, falling back to anonymous: %v", err)
+			}
+		}
+
 		creds, err := getVKCredsViaVKCallsPath(linkID)
 		if err == nil {
 			log.Printf("vk: success via VK Calls captcha-free path")
