@@ -425,7 +425,12 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 		return s, nil
 	}
 
-	step2URL := fmt.Sprintf("https://%s/method/calls.getAnonymousToken?v=5.275&client_id=%s", vkAPIHost(), vc.ClientID)
+	// VK API version for the calls.* methods. Bumped 5.275 → 5.282 on 2026-06-24
+	// (matching samosvalishe's working flow: const APIVersion = "5.282") as a
+	// candidate fix for the post-captcha vchat.joinConversationByLink failure
+	// (error.webrtc.auth.anonym_token.not_found) — the hypothesis is that a token
+	// minted at the stale version isn't valid at join. Keep both calls.* in sync.
+	step2URL := fmt.Sprintf("https://%s/method/calls.getAnonymousToken?v=5.282&client_id=%s", vkAPIHost(), vc.ClientID)
 
 	// Step 1: get anonymous messages token
 	// If savedToken1 is provided (captcha retry), reuse it instead of fetching a new one.
@@ -447,7 +452,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 
 	// Step 1.5: call getCallPreview (warms up the session, as in reference impl)
 	previewData := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&access_token=%s&device_id=%s", linkID, token1, deviceID)
-	_, _ = doRequest(previewData, fmt.Sprintf("https://%s/method/calls.getCallPreview?v=5.275&client_id=%s", vkAPIHost(), vc.ClientID))
+	_, _ = doRequest(previewData, fmt.Sprintf("https://%s/method/calls.getCallPreview?v=5.282&client_id=%s", vkAPIHost(), vc.ClientID))
 
 	// Step 2: get anonymous call token (with captcha retry)
 	var token2 string
@@ -455,11 +460,25 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 	var err error
 	step2Data := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
 
-	// If we have a pre-solved captcha (success_token from captchaNotRobot.check), include it.
-	if solvedCaptchaSID != "" && solvedCaptchaKey != "" {
-		log.Printf("vk: retrying step2 with success_token (%d chars), captcha_sid=%s", len(solvedCaptchaKey), solvedCaptchaSID)
-		step2Data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d&device_id=%s",
-			linkID, escapedName, token1, solvedCaptchaSID, neturl.QueryEscape(solvedCaptchaKey), solvedCaptchaTs, int(solvedCaptchaAttempt), deviceID)
+	// buildCaptchaRetry builds the step2 body carrying a solved captcha. VK's
+	// new error_code-14 format (2026-06-24) OMITS captcha_sid — it ships only
+	// redirect_uri + session_token. So when sid is empty we send ONLY the
+	// success_token and drop captcha_sid/captcha_key/ts/attempt (matching the
+	// samosvalishe/cacggghp fix); an empty captcha_sid in the body confuses VK.
+	buildCaptchaRetry := func(sid, successToken string, ts, attempt float64) string {
+		if sid == "" {
+			return fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&success_token=%s&device_id=%s",
+				linkID, escapedName, token1, neturl.QueryEscape(successToken), deviceID)
+		}
+		return fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d&device_id=%s",
+			linkID, escapedName, token1, sid, neturl.QueryEscape(successToken), ts, int(attempt), deviceID)
+	}
+
+	// If we have a pre-solved captcha (success_token), include it. Gate on the
+	// success_token only — the new VK format has no captcha_sid to require.
+	if solvedCaptchaKey != "" {
+		log.Printf("vk: retrying step2 with success_token (%d chars), captcha_sid=%q", len(solvedCaptchaKey), solvedCaptchaSID)
+		step2Data = buildCaptchaRetry(solvedCaptchaSID, solvedCaptchaKey, solvedCaptchaTs, solvedCaptchaAttempt)
 	}
 
 	for attempt := 0; attempt < 3; attempt++ {
@@ -477,7 +496,10 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 
 		// Check for captcha (VK error code 14)
 		captchaSID, captchaImg, captchaTs, captchaAttempt := extractCaptcha(resp)
-		if captchaSID != "" {
+		// Gate on the captcha URL (redirect_uri), NOT captcha_sid: VK's new
+		// error_code-14 format (2026-06-24) ships redirect_uri+session_token
+		// with NO captcha_sid, so a sid-gate would skip the solver entirely.
+		if captchaImg != "" {
 			log.Printf("vk: captcha required (attempt %d), url: %s", attempt+1, captchaImg)
 
 			// Try automatic PoW solver up to 3 times with fresh captcha sessions.
@@ -505,8 +527,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 
 				if powErr == nil && powToken != "" {
 					log.Printf("vk: PoW auto-solve succeeded on attempt %d (%d chars), retrying step2", powTry, len(powToken))
-					step2Data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d&device_id=%s",
-						linkID, escapedName, token1, currentSID, neturl.QueryEscape(powToken), currentTs, int(currentAttempt), deviceID)
+					step2Data = buildCaptchaRetry(currentSID, powToken, currentTs, currentAttempt)
 					powSolved = true
 					break
 				}
@@ -535,7 +556,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 						break
 					}
 					fSID, fImg, fTs, fAttempt := extractCaptcha(freshResp)
-					if fSID == "" {
+					if fImg == "" {
 						token2, err = extractStr(freshResp, "response", "token")
 						if err == nil {
 							powSolved = true
@@ -581,7 +602,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 			// issue is purely session_token consumption.
 			freshData := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
 			if freshResp, freshErr := doRequest(freshData, step2URL); freshErr == nil {
-				if fSID, fImg, fTs, fAttempt := extractCaptcha(freshResp); fSID != "" {
+				if fSID, fImg, fTs, fAttempt := extractCaptcha(freshResp); fImg != "" {
 					log.Printf("vk: fetched untouched captcha for caller (was sid=%s, now sid=%s)", currentSID, fSID)
 					currentSID = fSID
 					currentImg = fImg
@@ -608,8 +629,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 				return nil, fmt.Errorf("step2: captcha solver: %w", err)
 			}
 			log.Printf("vk: WebView captcha solver returned answer (%d chars), retrying", len(answer))
-			step2Data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d&device_id=%s",
-				linkID, escapedName, token1, currentSID, neturl.QueryEscape(answer), currentTs, int(currentAttempt), deviceID)
+			step2Data = buildCaptchaRetry(currentSID, answer, currentTs, currentAttempt)
 			continue
 		}
 
