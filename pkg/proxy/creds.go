@@ -661,6 +661,14 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 		return nil, fmt.Errorf("step4: %w", err)
 	}
 
+	// DIAGNOSTIC (2026-06-24): dump the raw okcdn join response so the standalone
+	// tool (and on-device logs) show EXACTLY what calls.okcdn.ru returns for our
+	// anonymToken — the wall is HERE (anonym_token.not_found), not the mint.
+	// Mirrors the step2-response diagnostic above.
+	if respJSON, mErr := json.Marshal(resp); mErr == nil {
+		log.Printf("vk: step4 (okcdn vchat.joinConversationByLink) response: %s", string(respJSON))
+	}
+
 	user, err := extractStr(resp, "turn_server", "username")
 	if err != nil {
 		return nil, fmt.Errorf("step4 parse username: %w", err)
