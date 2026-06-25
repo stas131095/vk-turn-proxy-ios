@@ -3087,6 +3087,23 @@ func (p *Proxy) WaitWrapAProvision(timeout time.Duration) (*WrapAProvision, erro
 	}
 }
 
+// addrFamilyFor returns the TURN REQUESTED-ADDRESS-FAMILY matching the peer's
+// IP family. The relayed allocation MUST be the same family as the peer it
+// sends to: RFC 8656 §9.2 rejects a CreatePermission whose family differs from
+// the allocation with 443 (Peer Address Family Mismatch). VK has no IPv6
+// relays, so an IPv6 peer yields an IPv6 allocate request that VK silently
+// drops — but requesting the *correct* family (rather than hardcoding IPv4,
+// which 443s on an IPv6 peer — issue #39) keeps both transport paths
+// consistent and makes the failure honest (a timeout meaning "no IPv6 relay"
+// instead of a misleading mismatch). Also future-proofs IPv6 if VK ever adds
+// IPv6 relays.
+func addrFamilyFor(peer *net.UDPAddr) turn.RequestedAddressFamily {
+	if peer != nil && peer.IP.To4() == nil {
+		return turn.RequestedAddressFamilyIPv6
+	}
+	return turn.RequestedAddressFamilyIPv4
+}
+
 // runTURN establishes a TURN relay and forwards packets between conn2 and the relay.
 // Runs until the relay fails or ctx is cancelled. No forced lifetime —
 // the pion/turn client handles allocation refresh automatically.
@@ -3118,13 +3135,8 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		turnConn = turn.NewSTUNConn(tcpConn)
 	}
 
-	// Determine address family
-	var addrFamily turn.RequestedAddressFamily
-	if p.peer.IP.To4() != nil {
-		addrFamily = turn.RequestedAddressFamilyIPv4
-	} else {
-		addrFamily = turn.RequestedAddressFamilyIPv6
-	}
+	// Determine the relay address family from the peer (see addrFamilyFor).
+	addrFamily := addrFamilyFor(p.peer)
 
 	cfg := &turn.ClientConfig{
 		STUNServerAddr:         turnAddr,
@@ -4709,7 +4721,10 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		Software:               "vk-turn-srtp",
 		// Custom factory (not pion's default LogLevelError) so SRTP-path TURN refresh/auth failures feed the silent-degradation watchdog + get sanitized, matching runTURN.
 		LoggerFactory:          &turnLoggerFactory{proxy: p, slot: credSlot},
-		RequestedAddressFamily: turn.RequestedAddressFamilyIPv4,
+		// Match the relay family to the peer (see addrFamilyFor) — was
+		// hardcoded IPv4, which 443'd ("Peer Address Family Mismatch") on an
+		// IPv6 peer (e.g. a DNS name resolving to AAAA) — issue #39.
+		RequestedAddressFamily: addrFamilyFor(p.peer),
 	})
 	if err != nil {
 		_ = ctlConn.Close()
