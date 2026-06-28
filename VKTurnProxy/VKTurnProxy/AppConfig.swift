@@ -228,4 +228,12 @@ struct ConnectionSettings: Codable {
     /// "recommended for this deployment" hint while still letting
     /// users tune later.
     let numConnections: Int?
+    // VKAuth (cookie auth) toggle. Optional, nil-preserve. Lets a connection link
+    // provision a device for the non-anonymous cookie path; cookies are NEVER in
+    // links (device Keychain only), so the device still logs in via WKWebView on
+    // first connect. A multiline vkLink above carries the call links. `var ... =
+    // nil` (like AppSettings.forceLegacyCaptcha) so Codable decodes it AND the
+    // synthesised memberwise init defaults it (existing construction sites — e.g.
+    // parseWdttLink — stay unchanged).
+    var vkAuth: Bool? = nil
 }

@@ -562,6 +562,7 @@ enum BackupManager {
         if let v = s.turnServerOverride { d.set(v, forKey: "turnServerOverride") }
         if let v = s.dnsServers { d.set(v, forKey: "dnsServers") }
         if let v = s.numConnections { d.set(v, forKey: "numConnections") }
+        if let v = s.vkAuth { d.set(v, forKey: "VKAuth") }
         // Log the RESOLVED server mode (read back after applying) — that's the
         // field whose stale value caused the 2026-06-10 import bug, so it's the
         // useful thing to see in triage.
