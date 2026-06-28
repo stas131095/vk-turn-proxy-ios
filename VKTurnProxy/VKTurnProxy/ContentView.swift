@@ -172,6 +172,13 @@ struct ContentView: View {
                             let vkLines = vkLink.split(whereSeparator: { $0.isNewline })
                                 .map { $0.trimmingCharacters(in: .whitespaces) }
                                 .filter { !$0.isEmpty }
+                            let vkAuthOn = UserDefaults.standard.bool(forKey: "VKAuth")
+                            // Effective conns: cookie mode caps at min(50, 20×lines).
+                            // Applied here (non-destructive) so the stored Connections
+                            // setting is preserved across mode/line changes.
+                            let effectiveConns = vkAuthOn
+                                ? min(numConnections, min(50, max(2, vkLines.count * 20)))
+                                : numConnections
                             let config = TunnelConfig(
                                 privateKey: privateKey,
                                 peerPublicKey: peerPublicKey,
@@ -502,7 +509,20 @@ struct SettingsView: View {
     // Cookie-mode connection cap: 2 relays per call × 10 conns/relay, global max 50.
     private var cookieConnCap: Int { min(50, max(2, vkLinkLines.count * 20)) }
     private var connectionsUpperBound: Int {
-        vkAuthEnabled ? cookieConnCap : max(50, numConnections)
+        // Non-destructive: preserve a stored value above the cookie cap (e.g. set
+        // when more call links existed, or carried over from anon mode). The cap
+        // is enforced on the EFFECTIVE conn count at connect (ContentView), not by
+        // mutating this stored setting.
+        vkAuthEnabled ? max(cookieConnCap, numConnections) : max(50, numConnections)
+    }
+    private var connectionsLabel: String {
+        if vkAuthEnabled && numConnections > cookieConnCap {
+            return "Connections: \(numConnections) → \(cookieConnCap) (add call links)"
+        }
+        if vkAuthEnabled {
+            return "Connections: \(numConnections) (max \(cookieConnCap))"
+        }
+        return "Connections: \(numConnections)"
     }
 
     var body: some View {
@@ -637,7 +657,7 @@ struct SettingsView: View {
                 // Link import — both bypass this Stepper) are preserved
                 // by widening the upper bound to max(50, current). Stepper
                 // can only decrease them; once back ≤ 50 the cap holds.
-                Stepper("Connections: \(numConnections)\(vkAuthEnabled ? " (max \(cookieConnCap))" : "")", value: $numConnections, in: 1...connectionsUpperBound)
+                Stepper(connectionsLabel, value: $numConnections, in: 1...connectionsUpperBound)
 
                 Stepper("Cred pool cooldown: \(credPoolCooldownSeconds) s", value: $credPoolCooldownSeconds, in: 30...600, step: 30)
             }
@@ -872,14 +892,11 @@ struct SettingsView: View {
         // Keep the session-status row fresh; auto-present login on first enable.
         .onAppear { refreshVKCookieInfo() }
         .onChange(of: vkAuthEnabled) { enabled in
-            if enabled {
-                // Clamp connections to the cookie-mode cap (lines × 20, max 50).
-                if numConnections > cookieConnCap { numConnections = cookieConnCap }
-                if !VKCookieStore.isValid() { showVKAuthLogin = true }
+            // Non-destructive: do NOT clamp the stored Connections value — the cap
+            // is applied to the EFFECTIVE conn count at connect (see ContentView).
+            if enabled && !VKCookieStore.isValid() {
+                showVKAuthLogin = true
             }
-        }
-        .onChange(of: vkLink) { _ in
-            if vkAuthEnabled && numConnections > cookieConnCap { numConnections = cookieConnCap }
         }
         // Result alert — shared across export/import/reset success and
         // error paths since the message is what differs, not the
