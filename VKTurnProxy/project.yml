@@ -120,6 +120,10 @@ targets:
       # fallback when the App Group container is unavailable and
       # SharedLogger silently no-ops.
       - path: VKTurnProxy/OSLogReader.swift
+      # VKCookieStore.swift — Keychain-backed VKAuth cookie store, compiled into
+      # the extension too so it can read the logged-in cookie at startTunnel
+      # (shared keychain-access-group, same App Group as the rest).
+      - path: VKTurnProxy/VKCookieStore.swift
     info:
       path: PacketTunnel/Info.plist
       properties:

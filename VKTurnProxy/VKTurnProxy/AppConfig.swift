@@ -121,6 +121,11 @@ struct AppSettings: Codable {
     /// `var` (not `let`) so the synthesised Decodable actually decodes it — an
     /// immutable property with an initial value is never decoded by Codable.
     var forceLegacyCaptcha: Bool? = nil
+    /// VKAuth (non-anonymous cookie cred path) toggle. Round-trips in full
+    /// backups so the preference is preserved. The cookies themselves are NEVER
+    /// in the backup — they live in the Keychain (VKCookieStore). Optional +
+    /// `var` so Codable decodes it (nil-preserve on import). Default nil.
+    var vkAuth: Bool? = nil
 }
 
 // MARK: - 1-Click Connection Link

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -179,6 +180,35 @@ func isTransientNetworkError(err error) bool {
 // (the saved token1 is bound to a specific client_id, so on a captcha-retry we MUST
 // reuse the same client). When empty, the normal client_id rotation+shuffle applies.
 func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, solvedCaptchaKey string, solvedCaptchaTs, solvedCaptchaAttempt float64, savedToken1, savedClientID string) (*TURNCreds, error) {
+	// Non-anonymous cookie (logged-in / "VKAuth") path. When the user enables
+	// cookie auth in Settings, this is the ONLY path — there is NO fallback to
+	// the anonymous VK Calls / legacy paths (the whole point is to keep working
+	// when VK has disabled anonymous join, so falling back would defeat it). On
+	// failure we return the error; a cookie REJECTION (ErrCookieRejected:
+	// expired/invalid) is latched into the cookie-auth fatal state so the
+	// extension can stop the tunnel with a clear "re-login" message instead of
+	// spinning. Cookie auth never triggers captcha, so the savedToken1 /
+	// solvedCaptcha* retry parameters never apply here. See creds_vkcookie.go.
+	if cookieAuthEnabled.Load() {
+		// Cookie (VKAuth) path. This entry (no slot) serves slot 0 — used by the
+		// pre-bootstrap probe to seed slot 0. The pool's per-slot fetches go
+		// through fetchFreshCreds -> cookieCredForSlot(slot) so each slot stably
+		// holds a distinct (call, relay) bucket. Single-relay creds; NO captcha;
+		// NO anonymous fallback.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		creds, err := cookieCredForSlot(ctx, 0)
+		cancel()
+		if err != nil {
+			if errors.Is(err, ErrCookieRejected) {
+				setCookieAuthFatal(err.Error())
+			}
+			return nil, fmt.Errorf("cookie auth: %w", err)
+		}
+		clearCookieAuthFatal()
+		log.Printf("vk: success via cookie (logged-in) path (slot 0 seed)")
+		return creds, nil
+	}
+
 	// VK Calls captcha-free path (added 2026-05-17 — see creds_vkcalls.go).
 	//
 	// Try this first on FRESH fetches only. Skip on captcha retry because:
@@ -189,25 +219,6 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 	// On any failure (including unexpected captcha gate appearing on the new
 	// path), fall through to the legacy multi-client_id retry loop below.
 	if savedToken1 == "" && solvedCaptchaSID == "" && savedClientID == "" {
-		// Non-anonymous cookie (logged-in) path — tried FIRST when the user
-		// has enabled cookie auth in Settings and a remixsid is present. This
-		// is the fallback for when VK disables anonymous call join. On any
-		// failure (e.g. cookie expired) we fall through to the anonymous paths
-		// below, so connectivity still works whenever anon is available.
-		// See creds_vkcookie.go.
-		if cookieAuthEnabled.Load() {
-			if ch := vkCookieHeader(); ch != "" {
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				creds, err := getVKCredsViaCookies(ctx, linkID, ch)
-				cancel()
-				if err == nil {
-					log.Printf("vk: success via cookie (logged-in) path")
-					return creds, nil
-				}
-				log.Printf("vk: cookie path failed, falling back to anonymous: %v", err)
-			}
-		}
-
 		creds, err := getVKCredsViaVKCallsPath(linkID)
 		if err == nil {
 			log.Printf("vk: success via VK Calls captcha-free path")
@@ -1125,7 +1136,7 @@ type credPool struct {
 	// Returns (address "host:port", creds, err). On CaptchaRequiredError
 	// the pool may choose to fall back to an existing entry instead of
 	// surfacing the error.
-	fetch func(allowCaptchaBlock bool) (string, *TURNCreds, error)
+	fetch func(allowCaptchaBlock bool, slot int) (string, *TURNCreds, error)
 
 	// cachePath is the on-disk JSON file that persists the pool across
 	// extension launches. Empty disables persistence. The file lives in
@@ -1394,7 +1405,7 @@ func (cp *credPool) authErrorCount(slot int) int64 {
 	return cp.authErrors[slot].Load()
 }
 
-func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePath string, fetch func(bool) (string, *TURNCreds, error)) *credPool {
+func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePath string, fetch func(bool, int) (string, *TURNCreds, error)) *credPool {
 	if size < 1 {
 		size = 1
 	}
@@ -1897,7 +1908,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	cp.mu.Unlock()
 
 	// Inline fetch — runs WITHOUT mu so get() on other slots stays fast.
-	addr, creds, fetchErr := cp.fetch(allowCaptchaBlock)
+	addr, creds, fetchErr := cp.fetch(allowCaptchaBlock, target)
 
 	cp.mu.Lock()
 	cp.pool[target].fetching = false
@@ -2385,7 +2396,7 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool, abortIfAvailableGT
 	cp.pool[slot].fetching = true
 	cp.mu.Unlock()
 
-	addr, creds, err := cp.fetch(allowCaptchaBlock)
+	addr, creds, err := cp.fetch(allowCaptchaBlock, slot)
 
 	cp.mu.Lock()
 	cp.pool[slot].fetching = false

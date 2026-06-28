@@ -43,6 +43,9 @@ struct TunnelStats: Codable {
     var tunnelUptimeSec: Int64 = 0
     var captchaImageURL: String?
     var captchaSID: String?
+    // Non-empty when cookie (VKAuth) auth hit an unrecoverable rejection. The
+    // main app reads it during stats polling → shows a message + stops the tunnel.
+    var authError: String?
 
     enum CodingKeys: String, CodingKey {
         case txBytes = "tx_bytes"
@@ -58,6 +61,7 @@ struct TunnelStats: Codable {
         case tunnelUptimeSec = "tunnel_uptime_sec"
         case captchaImageURL = "captcha_image_url"
         case captchaSID = "captcha_sid"
+        case authError = "auth_error"
     }
 }
 
@@ -259,6 +263,65 @@ class TunnelManager: ObservableObject {
             var savedAttempt: Double = 0
             var seededTURN: (address: String, username: String, password: String)? = nil
 
+            if config.useCookieAuth {
+                // ── VKAuth (non-anonymous cookie) pre-bootstrap ──────────────
+                // No captcha here. Ensure a valid logged-in cookie (show the
+                // login WebView if missing/expired), push it into the main-app
+                // Go runtime, then do ONE cookie-probe to validate it + seed the
+                // first TURN cred. NO anonymous fallback (matches the Go side).
+                UserDefaults(suiteName: "group.com.vkturnproxy.app")?.removeObject(forKey: "vkauth_error")
+
+                if !VKCookieStore.isValid() {
+                    SharedLogger.shared.log("[AppDebug] VKAuth: no valid cookie — presenting login WebView")
+                    switch await awaitVKLogin() {
+                    case .harvested(let header, let expiry):
+                        VKCookieStore.save(cookieHeader: header, expiry: expiry)
+                        SharedLogger.shared.log("[AppDebug] VKAuth: cookie harvested (expires \(expiry))")
+                    case .cancelled:
+                        SharedLogger.shared.log("[AppDebug] VKAuth: login cancelled — aborting")
+                        errorMessage = "Вход в VK отменён"
+                        return
+                    }
+                }
+                guard let cookieHeader = VKCookieStore.validCookieHeader() else {
+                    errorMessage = "Нет действительной VK-сессии. Войдите в Настройках."
+                    return
+                }
+                let linksJSON = (try? String(data: JSONSerialization.data(withJSONObject: config.cookieLinks), encoding: .utf8)) ?? "[]"
+                cookieHeader.withCString { cptr in
+                    linksJSON.withCString { lptr in
+                        wgSetVKCookieAuth(1, cptr, lptr)
+                    }
+                }
+
+                switch await probeVKCreds(linkID: linkID, vkHostIPsJSON: hostIPsJSONStr) {
+                case .ok(let addr, let user, let pass):
+                    if let h = config.turnServerOverride, !h.isEmpty,
+                       let pt = config.turnPortOverride, !pt.isEmpty {
+                        seededTURN = ("\(h):\(pt)", user, pass)
+                        SharedLogger.shared.log("[AppDebug] VKAuth: TURN override active — using \(h):\(pt) (VK gave \(addr))")
+                    } else {
+                        seededTURN = (addr, user, pass)
+                        SharedLogger.shared.log("[AppDebug] VKAuth: TURN creds via cookie path (addr=\(addr))")
+                    }
+                case .cookieRejected:
+                    SharedLogger.shared.log("[AppDebug] VKAuth: cookie rejected by VK — aborting")
+                    errorMessage = "VK перестал принимать сохранённую сессию. Войдите заново (Настройки → Log in to VK)."
+                    return
+                case .captcha:
+                    SharedLogger.shared.log("[AppDebug] VKAuth: unexpected captcha in cookie mode — aborting")
+                    errorMessage = "Не удалось подключиться (неожиданная капча в режиме VK-аккаунта)."
+                    return
+                case .error(let msg):
+                    SharedLogger.shared.log("[AppDebug] VKAuth: probe error: \(msg)")
+                    errorMessage = "Не удалось подключиться: \(msg)"
+                    return
+                }
+            } else {
+                // Reset any stale cookie state in the main-app Go runtime so the
+                // anonymous probe below isn't accidentally gated on it.
+                wgSetVKCookieAuth(0, "", "[]")
+
             // Cache fast-path: the extension persists every successfully-
             // fetched VK cred to creds-pool.json in the App Group container
             // (see pkg/proxy/creds.go credPool.saveToDisk). On a typical
@@ -347,12 +410,18 @@ class TunnelManager: ObservableObject {
                         SharedLogger.shared.log("[AppDebug] pre-bootstrap: user dismissed captcha — aborting")
                         return
                     }
+                case .cookieRejected(let msg):
+                    // Not expected on the anonymous path; treat as a hard error.
+                    SharedLogger.shared.log("[AppDebug] pre-bootstrap: unexpected cookieRejected: \(msg)")
+                    errorMessage = "Не удалось подключиться: \(msg)"
+                    return
                 case .error(let msg):
                     SharedLogger.shared.log("[AppDebug] pre-bootstrap: error: \(msg)")
                     errorMessage = "Не удалось подключиться: \(msg)"
                     return
                 }
             }
+            } // end anonymous path (`else` of `if config.useCookieAuth`)
 
             guard let seeded = seededTURN else {
                 SharedLogger.shared.log("[AppDebug] pre-bootstrap: exhausted 5 attempts without success")
@@ -422,7 +491,14 @@ class TunnelManager: ObservableObject {
                 // WRAP-A: tells the extension to fetch the GETCONF-minted WG
                 // config (wgWaitWrapAProvision) and override wg_config +
                 // address/dns/mtu after bootstrap, since the user entered none.
-                "use_wrap_a": config.useWrapA
+                "use_wrap_a": config.useWrapA,
+                // VKAuth: tells the extension to read the logged-in cookie from
+                // the shared Keychain and push it via wgSetVKCookieAuth before
+                // bootstrap (the cookie itself is NOT in this config).
+                "use_cookie_auth": config.useCookieAuth,
+                // VKAuth call links (cookie mode): the pool spreads conns across
+                // each call's 2 TURN relays. Not a secret — just call link IDs.
+                "vk_cookie_links": config.cookieLinks
             ]
 
             // Full-tunnel mode (Step 4 of the APNs-through-tunnel refactor).
@@ -750,6 +826,34 @@ class TunnelManager: ObservableObject {
         return result
     }
 
+    // MARK: - VKAuth login WebView (cookie harvest)
+
+    // Drives the embedded VK-login sheet in ContentView during the cookie
+    // pre-bootstrap. Mirrors the captcha sheet mechanism (captchaPending +
+    // preBootstrapResolver).
+    @Published var vkLoginPending = false
+    private var vkLoginResolver: CheckedContinuation<VKAuthResult, Never>?
+
+    /// Presents the VK-login WebView and suspends until the user logs in
+    /// (cookie harvested) or cancels.
+    func awaitVKLogin() async -> VKAuthResult {
+        return await withCheckedContinuation { (cont: CheckedContinuation<VKAuthResult, Never>) in
+            DispatchQueue.main.async {
+                self.vkLoginResolver = cont
+                self.vkLoginPending = true
+            }
+        }
+    }
+
+    /// Called by ContentView when the login sheet finishes; resumes awaitVKLogin.
+    func onVKLoginResult(_ result: VKAuthResult) {
+        vkLoginPending = false
+        if let r = vkLoginResolver {
+            vkLoginResolver = nil
+            r.resume(returning: result)
+        }
+    }
+
     // MARK: - Private
 
     private func loadManager() async {
@@ -855,6 +959,14 @@ class TunnelManager: ObservableObject {
                     self.stopStatsPolling()
                     self.resetCaptchaState()
                     self.connectedAt = nil
+                    // If the extension self-stopped due to a rejected VKAuth
+                    // cookie, it wrote the reason to the App Group before
+                    // cancelling — surface it (and clear it so it shows once).
+                    if let shared = UserDefaults(suiteName: "group.com.vkturnproxy.app"),
+                       let ae = shared.string(forKey: "vkauth_error"), !ae.isEmpty {
+                        self.errorMessage = "Сессия VK отклонена или истекла. Войдите заново в Настройках."
+                        shared.removeObject(forKey: "vkauth_error")
+                    }
                 default:
                     // .disconnecting only — keep polling/state, the tunnel
                     // may recover momentarily (e.g., sleep/wake cycle).
@@ -953,6 +1065,16 @@ class TunnelManager: ObservableObject {
                         self.prevRx = newStats.rxBytes
                         self.prevTime = now
                         self.stats = newStats
+
+                        // VKAuth: the extension reports a fatal cookie rejection
+                        // via auth_error. Surface it and stop the tunnel (we
+                        // can't show a login WebView from the background).
+                        if let ae = newStats.authError, !ae.isEmpty {
+                            self.debugLog("VKAuth: stats.auth_error='\(ae)' — stopping tunnel")
+                            self.errorMessage = "Сессия VK отклонена или истекла. Войдите заново в Настройках."
+                            self.disconnect()
+                            return
+                        }
 
                         // Sync connectedAt from extension-reported uptime so
                         // the StatsView Uptime ticker reflects how long the
@@ -1227,7 +1349,8 @@ class TunnelManager: ObservableObject {
             "num_conns": config.numConnections,
             "cred_pool_cooldown_seconds": config.credPoolCooldownSeconds,
             "turn_server": config.turnServerOverride ?? "",
-            "turn_port": config.turnPortOverride ?? ""
+            "turn_port": config.turnPortOverride ?? "",
+            "use_cookie_auth": config.useCookieAuth
         ]
         // WRAP-A (amurcanov interop): the server provisions WireGuard via
         // GETCONF, so we send the password + a stable deviceID instead of WG
@@ -1359,6 +1482,7 @@ class TunnelManager: ObservableObject {
     enum ProbeResult {
         case ok(address: String, username: String, password: String)
         case captcha(url: String, sid: String, ts: Double, attempt: Double, token1: String, clientID: String, isRateLimit: Bool)
+        case cookieRejected(message: String)
         case error(message: String)
     }
 
@@ -1418,7 +1542,11 @@ class TunnelManager: ObservableObject {
                     isRateLimit: dict["is_rate_limit"] as? Bool ?? false
                 )
             default:
-                return .error(message: dict["message"] as? String ?? "unknown probe error")
+                let msg = dict["message"] as? String ?? "unknown probe error"
+                if (dict["cookie_rejected"] as? Bool) == true {
+                    return .cookieRejected(message: msg)
+                }
+                return .error(message: msg)
             }
         }.value
     }
@@ -1510,7 +1638,9 @@ struct TunnelConfig {
     var persistentKeepalive: Int = 25
 
     // Proxy
-    var vkLink: String = ""
+    var vkLink: String = ""  // primary call link (first line); anon + serverAddress
+    // All call links (cookie/VKAuth mode): each adds 2 TURN relays. First == vkLink.
+    var cookieLinks: [String] = []
     var peerAddress: String = ""  // vk-turn-proxy server host:port
     var useDTLS: Bool = true
     // WRAP layer: ChaCha20-XOR every UDP packet between DTLS and TURN
@@ -1560,6 +1690,10 @@ struct TunnelConfig {
     // captchaNotRobot.* solver runs. Set via a `forceLegacyCaptcha` field in
     // the backup JSON (no Settings UI). Default false → no production effect.
     var forceLegacyCaptcha: Bool = false
+    // VKAuth: when true, the cred path uses ONLY the logged-in VK cookie (no
+    // anonymous fallback). The cookie itself lives in the Keychain
+    // (VKCookieStore); this flag flows to Go via proxy_config use_cookie_auth.
+    var useCookieAuth: Bool = false
     var numConnections: Int = 30 // configurable from Settings; VK allows ~10 simultaneous TURN allocations per cred set, so 30 conns spreads over ceil(N/10) = 3 cred sets plus a "+1 reserve" (4 total slots). 30 strikes a useful balance: enough parallelism for high-throughput single sessions, few enough to avoid overwhelming VK's per-IP rate-limit on cred refresh.
     // Per-slot cooldown after a failed fetch (typically captcha required).
     // Slot stays in cooldown for this long before being eligible to retry.

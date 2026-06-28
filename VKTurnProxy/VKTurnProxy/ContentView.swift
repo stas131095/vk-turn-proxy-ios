@@ -169,6 +169,9 @@ struct ContentView: View {
                             NSLog("[UI] user pressed Connect button (status=\(tunnel.status.rawValue))")
                             SharedLogger.shared.log("[UI] user pressed Connect button (status=\(tunnel.status.rawValue))")
                             let turnOv = parseTurnOverride(turnServerOverride)
+                            let vkLines = vkLink.split(whereSeparator: { $0.isNewline })
+                                .map { $0.trimmingCharacters(in: .whitespaces) }
+                                .filter { !$0.isEmpty }
                             let config = TunnelConfig(
                                 privateKey: privateKey,
                                 peerPublicKey: peerPublicKey,
@@ -176,7 +179,8 @@ struct ContentView: View {
                                 tunnelAddress: tunnelAddress,
                                 dnsServers: dnsServers,
                                 allowedIPs: allowedIPs,
-                                vkLink: vkLink,
+                                vkLink: vkLines.first ?? vkLink,
+                                cookieLinks: vkLines,
                                 peerAddress: peerAddress,
                                 useDTLS: useDTLS,
                                 useWrap: useWrap,
@@ -186,6 +190,7 @@ struct ContentView: View {
                                 wrapAPassword: wrapAPassword,
                                 useUDP: useUDP,
                                 forceLegacyCaptcha: UserDefaults.standard.bool(forKey: "forceLegacyCaptcha"),
+                                useCookieAuth: UserDefaults.standard.bool(forKey: "VKAuth"),
                                 numConnections: numConnections,
                                 credPoolCooldownSeconds: credPoolCooldownSeconds,
                                 turnServerOverride: turnOv?.host,
@@ -250,6 +255,13 @@ struct ContentView: View {
                         onLog: { tunnel.logFromCaptchaView($0) },
                         tunnel: tunnel
                     )
+                }
+            }
+            // VKAuth login during cookie pre-bootstrap (connect flow). Driven by
+            // tunnel.vkLoginPending; on result, resume awaitVKLogin().
+            .sheet(isPresented: $tunnel.vkLoginPending) {
+                VKAuthWebView { result in
+                    tunnel.onVKLoginResult(result)
                 }
             }
         }
@@ -390,6 +402,12 @@ struct SettingsView: View {
     @AppStorage("useUDP") private var useUDP = false
     @AppStorage("numConnections") private var numConnections = 30
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
+    // VKAuth: the non-anonymous "VK account (cookie)" cred-path toggle. When ON,
+    // the app uses ONLY the cookie path (no anonymous fallback). The cookies
+    // themselves live in the Keychain (VKCookieStore), NOT here and NOT in
+    // backups — this is just the on/off switch. Turning it OFF does not delete
+    // the cookies.
+    @AppStorage("VKAuth") private var vkAuthEnabled = false
 
     // Backup & Restore state. exportURL drives the share sheet; the
     // sheet only appears when this is non-nil so the URL is guaranteed
@@ -408,6 +426,10 @@ struct SettingsView: View {
     @State private var showImportConfirm = false
     @State private var showResetConfirm = false
     @State private var showResetProfileConfirm = false
+    // VKAuth (cookie login) UI state.
+    @State private var showVKAuthLogin = false
+    @State private var showDeleteCookiesConfirm = false
+    @State private var vkCookieInfo: VKCookieStore.Stored? = nil
     @State private var alertMessage: String? = nil
     @State private var alertTitle: String = ""
 
@@ -469,14 +491,36 @@ struct SettingsView: View {
         }
     }
 
+    // VKAuth multi-call helpers. vkLink is multiline: anonymous mode uses the
+    // FIRST line; cookie (VKAuth) mode uses ALL lines (each call = 2 TURN relays).
+    private var vkLinkLines: [String] {
+        vkLink.split(whereSeparator: { $0.isNewline })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+    private var vkLinkPrimary: String { vkLinkLines.first ?? "" }
+    // Cookie-mode connection cap: 2 relays per call × 10 conns/relay, global max 50.
+    private var cookieConnCap: Int { min(50, max(2, vkLinkLines.count * 20)) }
+    private var connectionsUpperBound: Int {
+        vkAuthEnabled ? cookieConnCap : max(50, numConnections)
+    }
+
     var body: some View {
         Form {
             Section("VK TURN Proxy") {
-                TextField("VK Call Link", text: $vkLink)
-                    .textContentType(.URL)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                hint(ConfigValidation.vkLink(vkLink))
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(vkAuthEnabled ? "VK Call Link(s) — one per line" : "VK Call Link")
+                        .font(.caption).foregroundColor(.secondary)
+                    TextEditor(text: $vkLink)
+                        .frame(minHeight: vkAuthEnabled ? 80 : 38)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                }
+                if vkAuthEnabled {
+                    Text("VKAuth uses ALL lines: each call link adds 2 TURN relays (~20 connections). The first line is also the call used by anonymous mode.")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                hint(ConfigValidation.vkLink(vkLinkPrimary))
 
                 TextField("Proxy Server (host:port)", text: $peerAddress)
                     .autocapitalization(.none)
@@ -588,7 +632,7 @@ struct SettingsView: View {
                 // Link import — both bypass this Stepper) are preserved
                 // by widening the upper bound to max(50, current). Stepper
                 // can only decrease them; once back ≤ 50 the cap holds.
-                Stepper("Connections: \(numConnections)", value: $numConnections, in: 1...max(50, numConnections))
+                Stepper("Connections: \(numConnections)\(vkAuthEnabled ? " (max \(cookieConnCap))" : "")", value: $numConnections, in: 1...connectionsUpperBound)
 
                 Stepper("Cred pool cooldown: \(credPoolCooldownSeconds) s", value: $credPoolCooldownSeconds, in: 30...600, step: 30)
             }
@@ -633,6 +677,39 @@ struct SettingsView: View {
                 // still flows into the WG config + backups/links.
             }
             } // end `if != .srtpWrapA` — WireGuard section hidden in WRAP-A mode
+
+            // VK Account Auth (non-anonymous cookie path). Default OFF. When ON,
+            // GetVKCreds uses ONLY the logged-in cookie (no anonymous fallback).
+            Section {
+                Toggle("Use VK account (cookie) auth", isOn: $vkAuthEnabled)
+
+                if vkAuthEnabled {
+                    HStack {
+                        Text("Session")
+                        Spacer()
+                        Text(vkCookieStatusText)
+                            .foregroundColor(vkCookieStatusColor)
+                    }
+                    .font(.subheadline)
+
+                    Button {
+                        showVKAuthLogin = true
+                    } label: {
+                        Label(vkCookieInfo == nil ? "Log in to VK…" : "Re-login to VK…",
+                              systemImage: "person.crop.circle.badge.checkmark")
+                    }
+
+                    if vkCookieInfo != nil {
+                        Button(role: .destructive) { showDeleteCookiesConfirm = true } label: {
+                            Label("Delete saved cookies", systemImage: "trash")
+                        }
+                    }
+                }
+            } header: {
+                Text("VK Account Auth")
+            } footer: {
+                Text("Non-anonymous fallback for when VK disables anonymous call join. Log in to a VK account (a burner is recommended) in an embedded browser — 2FA works. Only the session cookies are stored, in the Keychain, never in a backup. When ON the app uses ONLY this path (no anonymous fallback). Turning it OFF keeps the saved cookies for later.")
+            }
 
             Section {
                 Button(action: handleExport) {
@@ -768,6 +845,36 @@ struct SettingsView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Deletes the captured browser fingerprint used by the auto-PoW captcha solver. Until the next manual captcha solve, the solver will use generated values which VK detects as bot far more often.")
+        }
+        // VK account login — embedded WKWebView. On success, harvest remixsid+p
+        // into the Keychain (VKCookieStore); the status row flips to Active.
+        .sheet(isPresented: $showVKAuthLogin) {
+            VKAuthWebView { result in
+                showVKAuthLogin = false
+                if case let .harvested(cookieHeader, expiry) = result {
+                    VKCookieStore.save(cookieHeader: cookieHeader, expiry: expiry)
+                    refreshVKCookieInfo()
+                }
+            }
+        }
+        // Delete-cookies confirm — mirrors the Reset TURN Cache pattern.
+        .alert("Delete saved cookies?", isPresented: $showDeleteCookiesConfirm) {
+            Button("Delete", role: .destructive) { handleDeleteCookies() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Removes the stored VK session cookies. You'll need to log in again to use VK account auth.")
+        }
+        // Keep the session-status row fresh; auto-present login on first enable.
+        .onAppear { refreshVKCookieInfo() }
+        .onChange(of: vkAuthEnabled) { enabled in
+            if enabled {
+                // Clamp connections to the cookie-mode cap (lines × 20, max 50).
+                if numConnections > cookieConnCap { numConnections = cookieConnCap }
+                if !VKCookieStore.isValid() { showVKAuthLogin = true }
+            }
+        }
+        .onChange(of: vkLink) { _ in
+            if vkAuthEnabled && numConnections > cookieConnCap { numConnections = cookieConnCap }
         }
         // Result alert — shared across export/import/reset success and
         // error paths since the message is what differs, not the
@@ -909,6 +1016,33 @@ struct SettingsView: View {
             alertTitle = "Reset Failed"
             alertMessage = error.localizedDescription
         }
+    }
+
+    // MARK: - VK account (cookie) auth
+
+    private var vkCookieStatusText: String {
+        guard let info = vkCookieInfo else { return "Not logged in" }
+        if info.expiry <= Date() { return "Expired — re-login" }
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .none
+        return "Active · expires \(f.string(from: info.expiry))"
+    }
+
+    private var vkCookieStatusColor: Color {
+        guard let info = vkCookieInfo else { return .orange }
+        return info.expiry <= Date() ? .orange : .green
+    }
+
+    private func refreshVKCookieInfo() {
+        vkCookieInfo = VKCookieStore.load()
+    }
+
+    private func handleDeleteCookies() {
+        VKCookieStore.delete()
+        refreshVKCookieInfo()
+        alertTitle = "Cookies Deleted"
+        alertMessage = "Stored VK session cookies removed."
     }
 }
 

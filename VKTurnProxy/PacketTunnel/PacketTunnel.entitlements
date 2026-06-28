@@ -10,6 +10,12 @@
 	<array>
 		<string>group.com.vkturnproxy.app</string>
 	</array>
+	<!-- Shared keychain group for the VKAuth logged-in cookie (VKCookieStore),
+	     read by the extension at startTunnel. Must match VKTurnProxy.entitlements. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.vkturnproxy.shared</string>
+	</array>
 	<!-- Required for NEHotspotNetwork.fetchCurrent in PacketTunnelProvider
 	     to return non-nil network data. Without this, fetchCurrent silently
 	     returns nil even from a VPN extension context (verified 2026-05-11

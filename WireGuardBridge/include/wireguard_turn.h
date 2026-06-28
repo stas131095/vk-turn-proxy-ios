@@ -135,6 +135,23 @@ void wgSetLogFilePath(const char *path);
 /// Go runtime on iOS has no tzdata, so this aligns Go log timestamps with local time.
 void wgSetTimezoneOffset(int offsetSeconds);
 
+/// Set the cookie ("VKAuth") cred-path state for this process. Call BEFORE
+/// wgProbeVKCreds (main app) or wgStartVKBootstrap (extension) when the user
+/// has enabled VKAuth: read the harvested logged-in cookie from the shared
+/// Keychain and pass it here. The cookie is passed out-of-band (NOT in the
+/// ProxyConfig JSON) so it never persists in the VPN providerConfiguration.
+/// @param enabled 1 = cookie path ONLY (no anonymous fallback); 0 = anonymous
+/// @param cookie  Raw Cookie header ("remixsid=…; p=…"); "" when disabling
+/// @param links_json JSON array of call links — the cookie pool spreads conns
+///        across each call's relays (~10 per relay). "" / "[]" = none.
+void wgSetVKCookieAuth(int32_t enabled, const char *cookie, const char *links_json);
+
+/// Returns the current cookie ("VKAuth") fatal-auth message, or "" if none.
+/// The extension polls this after bootstrap (cookie mode only) — a non-empty
+/// value means the saved cookie was rejected/expired in the background, so the
+/// extension stops the tunnel with a clear message. Caller must free().
+const char *wgGetAuthError(void);
+
 /// Probe VK credentials in the main-app process before startVPNTunnel,
 /// to pre-solve any captcha while the main app still has full network
 /// access (Step 4's deferred-tunnel-settings architecture cuts off

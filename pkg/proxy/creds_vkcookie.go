@@ -3,12 +3,14 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	neturl "net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -51,17 +53,143 @@ const (
 var (
 	cookieAuthEnabled atomic.Bool
 	cookieHeaderStore atomic.Value // string — the raw Cookie header, e.g. "remixsid=…"
+	cookieAuthFatal   atomic.Value // string — non-empty when the cookie was rejected/expired (re-login required)
+	cookieLinksStore  atomic.Value // []string — call-link IDs for the multi-relay cookie pool
+
+	cookieMu    sync.Mutex
+	cookieCache = map[string]*cookieCachedCred{} // linkID -> last successful mint (multi-relay)
 )
 
+// cookieCachedCred caches one call's minted (multi-relay) cred so both of its
+// relays are served from a single mint until the cred nears expiry.
+type cookieCachedCred struct {
+	creds *TURNCreds
+}
+
+// ErrCookieRejected signals that the logged-in cookie is no longer accepted by
+// VK (expired, invalidated, or incomplete) — re-login is required. It is
+// distinct from a transient network error: GetVKCreds latches it into the
+// cookie-auth fatal state (surfaced via Stats.AuthError) so the extension can
+// stop the tunnel with a clear message instead of spinning on a dead cookie.
+var ErrCookieRejected = errors.New("vk cookie rejected: expired/invalid/incomplete (re-login required)")
+
 // SetVKCookieAuth enables/disables the cookie (logged-in) cred path and sets
-// the Cookie header to send. Called from bridge.go when applying ProxyConfig.
-func SetVKCookieAuth(enabled bool, cookieHeader string) {
+// the Cookie header + the call links (one per relay-cluster — see
+// cookieCredForSlot). Called from bridge.go (wgSetVKCookieAuth). Clears any
+// prior fatal latch + the per-link mint cache — a (re)configure means the app
+// supplied a fresh cookie / changed mode / changed the link set.
+func SetVKCookieAuth(enabled bool, cookieHeader string, links []string) {
 	cookieAuthEnabled.Store(enabled)
 	cookieHeaderStore.Store(strings.TrimSpace(cookieHeader))
+	cookieAuthFatal.Store("")
+	norm := make([]string, 0, len(links))
+	for _, l := range links {
+		if id := cookieLinkID(l); id != "" {
+			norm = append(norm, id)
+		}
+	}
+	cookieLinksStore.Store(norm)
+	cookieMu.Lock()
+	cookieCache = map[string]*cookieCachedCred{}
+	cookieMu.Unlock()
+}
+
+func cookieLinks() []string {
+	if v, ok := cookieLinksStore.Load().([]string); ok {
+		return v
+	}
+	return nil
+}
+
+// cookieLinkID extracts a bare join-link id from a full URL or an id.
+func cookieLinkID(s string) string {
+	id := strings.TrimSpace(s)
+	if i := strings.LastIndex(id, "join/"); i >= 0 {
+		id = id[i+len("join/"):]
+	}
+	id = strings.TrimRight(id, "/")
+	if i := strings.IndexAny(id, "?#"); i > 0 {
+		id = id[:i]
+	}
+	return id
+}
+
+// cookieCredForSlot returns a SINGLE-relay TURN cred for pool slot `slot`,
+// mapping slot -> (call link, relay) deterministically: link = (slot/2) over the
+// configured links, relay = slot%2 (2 relays per call, observed). This makes each
+// slot stably hold one (okcdn_userid, relay) bucket — each its own ~10-allocation
+// quota (2026-06-28 finding) — so the pool spreads conns across relays instead of
+// hammering one. Mints lazily per link and caches the multi-relay result (one mint
+// serves both relays); re-mints when the cached cred nears expiry. NO captcha.
+func cookieCredForSlot(ctx context.Context, slot int) (*TURNCreds, error) {
+	ch := vkCookieHeader()
+	if ch == "" {
+		return nil, fmt.Errorf("no VK cookie stored: %w", ErrCookieRejected)
+	}
+	links := cookieLinks()
+	if len(links) == 0 {
+		return nil, fmt.Errorf("cookie auth: no call links configured")
+	}
+	if slot < 0 {
+		slot = 0
+	}
+	linkIdx := (slot / 2) % len(links)
+	relayIdx := slot % 2
+	linkID := links[linkIdx]
+
+	cookieMu.Lock()
+	defer cookieMu.Unlock()
+	cc := cookieCache[linkID]
+	if cc == nil || cc.creds == nil || cookieCredStale(cc.creds) {
+		creds, err := getVKCredsViaCookies(ctx, linkID, ch)
+		if err != nil {
+			return nil, err
+		}
+		cc = &cookieCachedCred{creds: creds}
+		cookieCache[linkID] = cc
+	}
+	addrs := cc.creds.Addresses
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("cookie auth: minted cred has no relays")
+	}
+	addr := addrs[relayIdx%len(addrs)]
+	return &TURNCreds{
+		Username:  cc.creds.Username,
+		Password:  cc.creds.Password,
+		Address:   addr,
+		Addresses: []string{addr},
+	}, nil
+}
+
+// cookieCredStale reports whether a cached cookie cred is within the pool's
+// expiry buffer of its VK-supplied expiry (encoded in Username) — i.e. it's time
+// to re-mint the call. Unparseable expiry → not stale (let the pool drive refresh).
+func cookieCredStale(creds *TURNCreds) bool {
+	exp, ok := parseCredExpiry(creds.Username)
+	if !ok {
+		return false
+	}
+	return time.Until(exp) < credExpiryBuffer
 }
 
 func vkCookieHeader() string {
 	if v, ok := cookieHeaderStore.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// setCookieAuthFatal / clearCookieAuthFatal / CookieAuthFatalError manage the
+// "cookie is dead" latch that the iOS app reads via Stats.AuthError.
+func setCookieAuthFatal(msg string) { cookieAuthFatal.Store(msg) }
+
+func clearCookieAuthFatal() { cookieAuthFatal.Store("") }
+
+// CookieAuthFatalError returns a non-empty message when cookie auth has hit an
+// unrecoverable rejection (the cookie expired/invalid). The extension surfaces
+// it via GetStats and stops the tunnel with a user-readable message.
+func CookieAuthFatalError() string {
+	if v, ok := cookieAuthFatal.Load().(string); ok {
 		return v
 	}
 	return ""
@@ -133,9 +261,10 @@ func getVKCredsViaCookies(ctx context.Context, linkID, cookieHeader string) (*TU
 	vkToken, _ := cookieRespStr(webResp, "data", "access_token")
 	if vkToken == "" {
 		// Empty token == the cookie is no longer a valid session (or the
-		// cookie set is incomplete). This is the signal the UI should treat
-		// as "re-login required". Raw response attached for diagnosis.
-		return nil, fmt.Errorf("web_token: empty access_token — cookie expired/invalid/incomplete (re-login); resp=%s", truncRespMap(webResp))
+		// cookie set is incomplete). Wrap ErrCookieRejected so GetVKCreds
+		// latches the fatal "re-login required" state (Stats.AuthError) rather
+		// than spinning. Raw response attached for diagnosis.
+		return nil, fmt.Errorf("%w: web_token empty access_token; resp=%s", ErrCookieRejected, truncRespMap(webResp))
 	}
 
 	// Step 2: calls.getSettings — OK.ru application public_key.

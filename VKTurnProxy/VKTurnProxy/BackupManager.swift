@@ -110,7 +110,10 @@ enum BackupManager {
             // exported (per-install identity).
             useWrapA: (d.object(forKey: "useWrapA") as? Bool) ?? false,
             wrapAPassword: d.string(forKey: "wrapAPassword") ?? "",
-            turnServerOverride: d.string(forKey: "turnServerOverride")
+            turnServerOverride: d.string(forKey: "turnServerOverride"),
+            // VKAuth toggle round-trips in full backups (cookies do NOT — they
+            // live in the Keychain, never in the backup JSON).
+            vkAuth: (d.object(forKey: "VKAuth") as? Bool) ?? false
         )
 
         var turnPool: CredCacheFile? = nil
@@ -246,6 +249,7 @@ enum BackupManager {
         // forceLegacyCaptcha: undocumented on-device captcha-test toggle
         // (build 149) — same nil-preserves-default pattern.
         if let v = s.forceLegacyCaptcha { d.set(v, forKey: "forceLegacyCaptcha") }
+        if let v = s.vkAuth { d.set(v, forKey: "VKAuth") }
 
         SharedLogger.shared.log("[AppDebug] Backup: applied settings (numConnections=\(s.numConnections), cooldown=\(s.credPoolCooldownSeconds)s, useDTLS=\(s.useDTLS), useWrap=\(s.useWrap ?? false), useSrtp=\(s.useSrtp ?? false), useUDP=\(s.useUDP ?? false))")
 

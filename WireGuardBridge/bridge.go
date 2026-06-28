@@ -69,6 +69,7 @@ import "C"
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -193,6 +194,16 @@ type ProxyConfig struct {
 	// backup-JSON field. Default false → no production effect.
 	ForceLegacyCaptcha bool `json:"force_legacy_captcha,omitempty"`
 
+	// UseCookieAuth selects the non-anonymous "VKAuth" cred path (a logged-in VK
+	// session cookie → TURN creds; see pkg/proxy/creds_vkcookie.go). When true,
+	// GetVKCreds uses ONLY the cookie path — NO fallback to the anonymous VK
+	// Calls / legacy paths (the point is to keep working when VK disabled
+	// anonymous join). The cookie itself is NOT carried in this JSON: the
+	// extension reads it from the shared Keychain and pushes it via
+	// wgSetVKCookieAuth, so it never persists in the VPN providerConfiguration.
+	// Default false → anonymous paths as before.
+	UseCookieAuth bool `json:"use_cookie_auth,omitempty"`
+
 	// UseWrapA enables the "SRTP-WRAP-A" 4th transport mode — wire-compatible
 	// with amurcanov's proxy-turn-vk-android server (see proxy.Config.UseWrapA
 	// + pkg/proxy/wrapa.go + getconf.go). The server provisions WireGuard via
@@ -235,6 +246,9 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 		proxy.SetVKHostIPs(pcfg.VKHostIPs)
 	}
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
+	if !pcfg.UseCookieAuth {
+		proxy.SetVKCookieAuth(false, "", nil)
+	}
 
 	// Create proxy
 	wrapKey, wrapErr := decodeWrapKey(pcfg.UseWrap, pcfg.WrapKeyHex)
@@ -355,6 +369,13 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		proxy.SetVKHostIPs(pcfg.VKHostIPs)
 	}
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
+	// Defensive: when cookie auth isn't requested, force it OFF (the extension
+	// process can be reused across connects — clear any stale cookie state).
+	// When it IS requested, the extension has already called wgSetVKCookieAuth
+	// with the Keychain cookie before this, so leave that state intact.
+	if !pcfg.UseCookieAuth {
+		proxy.SetVKCookieAuth(false, "", nil)
+	}
 
 	// Seeded TURN creds from main app's pre-bootstrap captcha flow (optional).
 	var seededTURN *proxy.TURNCreds
@@ -890,6 +911,37 @@ func wgRefreshCaptchaURL(tunnelHandle C.int32_t) *C.char {
 	return C.CString(freshURL)
 }
 
+//export wgSetVKCookieAuth
+//
+// Sets this process's cookie ("VKAuth") cred-path state. The caller — the main
+// app before wgProbeVKCreds, or the extension before wgStartVKBootstrap — reads
+// the harvested logged-in cookie from the shared Keychain and passes it here
+// out-of-band. The cookie is deliberately NOT in ProxyConfig JSON so it never
+// lands in the persisted VPN providerConfiguration. Pass enabled=0, cookie=""
+// to force the anonymous paths. When enabled=1, GetVKCreds uses ONLY the cookie
+// path (no anonymous fallback). linksJSON is a JSON array of call links — in
+// cookie mode the pool spreads conns across each call's relays (~10 per relay).
+// See pkg/proxy/creds_vkcookie.go.
+func wgSetVKCookieAuth(enabled C.int32_t, cookie *C.char, linksJSON *C.char) {
+	var links []string
+	if lj := C.GoString(linksJSON); lj != "" {
+		_ = json.Unmarshal([]byte(lj), &links)
+	}
+	proxy.SetVKCookieAuth(enabled != 0, C.GoString(cookie), links)
+}
+
+//export wgGetAuthError
+//
+// Returns the current cookie ("VKAuth") fatal-auth message, or "" if none. The
+// extension polls this after bootstrap (cookie mode only): a non-empty value
+// means the logged-in cookie was rejected/expired during a background refresh,
+// so the extension stops the tunnel with a user-readable message (it can't show
+// a login WebView from the background). Process-global; no handle needed. Caller
+// frees the returned C string.
+func wgGetAuthError() *C.char {
+	return C.CString(proxy.CookieAuthFatalError())
+}
+
 // wgProbeVKCreds runs one round of GetVKCreds from the main app's process,
 // outside any tunnel session. Used by the pre-bootstrap captcha flow to
 // pre-solve VK captcha before startVPNTunnel — Step 4's deferred-tunnel-
@@ -949,6 +1001,11 @@ func wgProbeVKCreds(linkID, vkHostIPsJSON, savedSID, savedKey, savedToken1, save
 		} else {
 			resp["status"] = "error"
 			resp["message"] = err.Error()
+			// Let Swift distinguish a dead/expired cookie (→ show a clear
+			// re-login message) from other probe errors.
+			if errors.Is(err, proxy.ErrCookieRejected) {
+				resp["cookie_rejected"] = true
+			}
 		}
 	} else {
 		resp["status"] = "ok"

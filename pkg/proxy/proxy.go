@@ -135,6 +135,7 @@ type Stats struct {
 	TunnelUptimeSec   int64 `json:"tunnel_uptime_sec"`    // seconds since the proxy instance was created — the iOS UI uses this to render Uptime independent of main-app lifecycle (resists jetsam-respawn of the main app while extension keeps running)
 	CaptchaImageURL  string  `json:"captcha_image_url,omitempty"` // non-empty when captcha is pending
 	CaptchaSID       string  `json:"captcha_sid,omitempty"`       // captcha_sid for the pending captcha
+	AuthError        string  `json:"auth_error,omitempty"`        // non-empty when cookie (VKAuth) auth hit an unrecoverable rejection — the iOS app shows it + stops the tunnel
 }
 
 // Proxy manages the DTLS+TURN tunnel to the peer server.
@@ -473,7 +474,16 @@ func NewProxy(cfg Config) *Proxy {
 	// if <= 0. Per-entry freshness is now derived from each cred's
 	// VK-supplied expiry timestamp (see parseCredExpiry / credExpiryBuffer
 	// in creds.go) — no separate TTL setting needed.
-	p.credPool = newCredPool(ctx, poolSizeForNumConns(cfg.NumConns), cfg.CredPoolCooldown, cfg.CredCachePath, p.fetchFreshCreds)
+	poolSize := poolSizeForNumConns(cfg.NumConns)
+	if cookieAuthEnabled.Load() {
+		// Cookie (VKAuth) mode: one slot per relay (2 per call link), no 4×
+		// reserve — the relays are a finite set, so extra slots would just
+		// duplicate a relay and 486. See cookieCredForSlot.
+		if n := len(cookieLinks()); n > 0 {
+			poolSize = 2 * n
+		}
+	}
+	p.credPool = newCredPool(ctx, poolSize, cfg.CredPoolCooldown, cfg.CredCachePath, p.fetchFreshCreds)
 
 	// Seed slot 0 with pre-fetched TURN creds (from main app's pre-bootstrap
 	// captcha flow). The first conn's get() returns these without an API
@@ -1568,6 +1578,7 @@ func (p *Proxy) GetStats() Stats {
 		TunnelUptimeSec:   int64(time.Since(p.startedAt).Seconds()),
 		CaptchaImageURL:   captchaURL,
 		CaptchaSID:        captchaSID,
+		AuthError:         CookieAuthFatalError(),
 	}
 }
 
@@ -1958,7 +1969,25 @@ func (p *Proxy) resolveTURNAddr(connIdx int, allowCaptchaBlock bool) (string, *T
 // with captcha-token bookkeeping and TURN host:port parsing. Serialized
 // under credPool.mu, so only one fetch runs at a time — VK rate limiting
 // makes real parallelism pointless anyway.
-func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool) (string, *TURNCreds, error) {
+func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool, slot int) (string, *TURNCreds, error) {
+	var creds *TURNCreds
+
+	if cookieAuthEnabled.Load() {
+		// Cookie (VKAuth) mode: this pool slot maps to a stable (call, relay) so
+		// conns spread across relays — each (okcdn_userid, relay) is its own ~10
+		// allocation quota (2026-06-28 finding). No captcha bookkeeping here.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		c, cerr := cookieCredForSlot(ctx, slot)
+		cancel()
+		if cerr != nil {
+			if errors.Is(cerr, ErrCookieRejected) {
+				setCookieAuthFatal(cerr.Error())
+			}
+			return "", nil, fmt.Errorf("cookie auth: %w", cerr)
+		}
+		clearCookieAuthFatal()
+		creds = c
+	} else {
 	var solver CaptchaSolver
 	if allowCaptchaBlock {
 		solver = p.config.CaptchaSolver
@@ -1998,10 +2027,12 @@ func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool) (string, *TURNCreds, err
 	// savedClientID="" preserves existing mid-session behavior — proxy.go
 	// doesn't track client_id on captcha-retry today (independent of the
 	// pre-bootstrap captcha flow which does pin client_id strictly).
-	creds, err := GetVKCreds(p.linkID, solver, solvedSID, solvedKey, solvedTs, solvedAttempt, savedToken1, "")
+	c, err := GetVKCreds(p.linkID, solver, solvedSID, solvedKey, solvedTs, solvedAttempt, savedToken1, "")
 	if err != nil {
 		return "", nil, fmt.Errorf("get VK creds: %w", err)
 	}
+	creds = c
+	} // end else (anonymous path)
 	// Apply the "TURN server" override (Settings → optional turn_server/
 	// turn_port; empty = no override) to every VK-returned address. This is
 	// the fresh-fetch path: the override affects creds RECEIVED FROM VK and

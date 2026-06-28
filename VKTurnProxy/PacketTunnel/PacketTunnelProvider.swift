@@ -41,6 +41,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // missing entitlement, or extension lifecycle quirks).
     private var currentWiFiSSID: String?
 
+    // VKAuth background watchdog: polls the Go cookie fatal-auth latch; on a
+    // non-empty value (cookie rejected/expired mid-session) it stops the tunnel
+    // with a user-readable reason, since a login WebView can't be shown here.
+    private var authErrorTimer: DispatchSourceTimer?
+
     private func logMsg(_ msg: String) {
         os_log("%{public}s", log: log, type: .default, msg)
         NSLog("[PacketTunnel] %@", msg)
@@ -72,6 +77,48 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             shared.set(ip, forKey: Self.turnServerIPKey)
             logMsg("persistTurnServerIP: saved \(ip) to AppGroup for next connect()'s serverAddress")
         }
+    }
+
+    // VKAuth: shared-state key the extension writes (with the rejection reason)
+    // just before self-stopping, so the main app can show WHY on the next
+    // .disconnected transition even if it wasn't polling stats at the time.
+    private static let authErrorKey = "vkauth_error"
+
+    private func persistAuthError(_ msg: String) {
+        guard let shared = UserDefaults(suiteName: Self.sharedDefaultsSuiteName) else { return }
+        shared.set(msg, forKey: Self.authErrorKey)
+    }
+
+    // Starts the background cookie-rejection watchdog (cookie mode only). Every
+    // 20s it asks Go for the fatal-auth message; on a non-empty value it stops
+    // the tunnel with a clear error (cancelTunnelWithError) — the app surfaces
+    // the reason via the App Group key + stats auth_error.
+    private func startAuthErrorWatchdog() {
+        stopAuthErrorWatchdog()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 20, repeating: 20)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            guard let cptr = wgGetAuthError() else { return }
+            let msg = String(cString: cptr)
+            free(UnsafeMutableRawPointer(mutating: cptr))
+            guard !msg.isEmpty else { return }
+            self.logMsg("VKAuth: cookie rejected in background (\(msg)) — stopping tunnel")
+            self.persistAuthError(msg)
+            self.stopAuthErrorWatchdog()
+            let err = NSError(domain: "VKTurnProxy", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "VK session rejected or expired. Re-login in Settings."
+            ])
+            self.cancelTunnelWithError(err)
+        }
+        timer.resume()
+        authErrorTimer = timer
+        logMsg("VKAuth: started background cookie-rejection watchdog (20s)")
+    }
+
+    private func stopAuthErrorWatchdog() {
+        authErrorTimer?.cancel()
+        authErrorTimer = nil
     }
 
     // MARK: - Tunnel Lifecycle
@@ -166,6 +213,32 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         //                                packets through the already-live
         //                                TURN session.
         // ------------------------------------------------------------------
+        // VKAuth: if cookie auth is enabled, read the logged-in cookie from the
+        // shared Keychain and push it into the Go runtime BEFORE bootstrap. The
+        // cookie is intentionally NOT in proxy_config (so it never persists in
+        // the VPN providerConfiguration). With it set, GetVKCreds uses ONLY the
+        // cookie path. If disabled, force it off (the process may be reused).
+        let useCookieAuth = (config["use_cookie_auth"] as? Bool) ?? false
+        let cookieLinks = (config["vk_cookie_links"] as? [String]) ?? []
+        let cookieLinksJSON = (try? String(data: JSONSerialization.data(withJSONObject: cookieLinks), encoding: .utf8)) ?? "[]"
+        if useCookieAuth, let cookie = VKCookieStore.validCookieHeader() {
+            cookie.withCString { cptr in
+                cookieLinksJSON.withCString { lptr in
+                    wgSetVKCookieAuth(1, cptr, lptr)
+                }
+            }
+            logMsg("VKAuth: pushed Keychain cookie + \(cookieLinks.count) call link(s) to Go runtime")
+        } else {
+            "".withCString { cptr in
+                "[]".withCString { lptr in
+                    wgSetVKCookieAuth(0, cptr, lptr)
+                }
+            }
+            if useCookieAuth {
+                logMsg("VKAuth: enabled but no valid cookie in Keychain — bootstrap will fail (re-login needed)")
+            }
+        }
+
         logMsg("wgStartVKBootstrap: launching VK bootstrap goroutine...")
         let handle = proxyConfigJSON.withCString { proxyPtr in
             wgStartVKBootstrap(UnsafeMutablePointer(mutating: proxyPtr))
@@ -189,6 +262,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             switch ready {
             case 1:
                 self.logMsg("wgWaitBootstrapReady: ready")
+                if useCookieAuth {
+                    self.startAuthErrorWatchdog()
+                }
             case 0:
                 self.logMsg("wgWaitBootstrapReady: timeout after 120s — aborting")
                 wgTurnOff(handle)
@@ -418,6 +494,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let elapsedMs: () -> Int = { Int(Date().timeIntervalSince(started) * 1000) }
         logMsg("stopTunnel: entered (reason=\(reason.rawValue))")
         stopPathMonitoring()
+        stopAuthErrorWatchdog()
 
         // Safety net: ensure completionHandler is called exactly once
         // within 3 seconds even if wgTurnOff hangs. Without this, iOS

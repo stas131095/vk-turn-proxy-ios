@@ -10,6 +10,13 @@
 	<array>
 		<string>group.com.vkturnproxy.app</string>
 	</array>
+	<!-- Shared keychain group for the VKAuth logged-in cookie (VKCookieStore).
+	     Same group in PacketTunnel.entitlements so the extension can read it.
+	     $(AppIdentifierPrefix) expands to the team id ("CDMQ33VFQC.") at build. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.vkturnproxy.shared</string>
+	</array>
 	<!-- See PacketTunnel.entitlements for the rationale; mirrored here
 	     defensively in case Apple's entitlement check looks at the host
 	     app bundle as well. -->
