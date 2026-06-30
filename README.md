@@ -32,4 +32,6 @@ Based on [vk-turn-proxy](https://github.com/cacggghp/vk-turn-proxy) by [cacggghp
 
 ## License
 
-MIT
+[GNU General Public License v3.0](LICENSE) (GPL-3.0) — as a derivative of [vk-turn-proxy](https://github.com/cacggghp/vk-turn-proxy) (GPL-3.0).
+
+Files that carry an `SPDX-License-Identifier` header are additionally available under the license named there (e.g. MIT); the project as a whole is GPL-3.0.
